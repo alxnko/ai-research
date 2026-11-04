@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,70 +47,88 @@ When the task is complete:
 DONE
 
 Rules:
-- One command per turn. Wait for its output before the next.
-- You have {max_steps} turns. Read files with cat/head/tail, edit with
-  python3 - <<'EOF' heredocs or cat > file <<'EOF', inspect with ls/grep.
-- Tests are hidden. Make the code correct, not the tests pass.
-- No network access. No package installs.
+- Exactly one RUN or DONE per reply.
+- Never edit the test runner or files you are not asked to modify.
+- Do not run interactive commands (vi, nano, less, python without -c).
+- Make sure all your changes are saved to disk before saying DONE.
+- You have at most {max_steps} steps. Be concise.
 """
 
 
-# ---------- ollama ----------
-
-
-def chat(model, messages, ctx, ngpu, num_predict=2048, timeout=1800):
-    payload = {
+def chat(model, msgs, ctx, ngpu, timeout=1800):
+    body = {
         "model": model,
-        "messages": messages,
+        "messages": msgs,
         "stream": False,
-        "keep_alive": "10m",
         "options": {
             "num_ctx": ctx,
             "num_gpu": ngpu,
-            "num_predict": num_predict,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "top_k": 20,
+            "temperature": 0.0,
         },
     }
     req = urllib.request.Request(
         "http://127.0.0.1:11434/api/chat",
-        json.dumps(payload).encode(),
-        {"Content-Type": "application/json"},
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.load(r)
-    if "error" in d:
-        raise RuntimeError(d["error"])
-    msg = d["message"]
-    return msg.get("content", ""), msg.get("thinking", ""), d.get("eval_count", 0)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    msg = data.get("message", {})
+    return (
+        msg.get("content", ""),
+        msg.get("thinking", ""),
+        data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+    )
 
 
-def unload(model):
-    payload = {"model": model, "keep_alive": 0}
-    try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:11434/api/generate",
-            json.dumps(payload).encode(),
-            {"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=60).read()
-    except Exception:
-        pass
+def parse_action(reply):
+    """Extract the agent action from the model output.
+
+    Handles explicit format:
+        RUN: <command>
+        DONE
+
+    Also handles common minor formatting variations:
+        - fenced bash code blocks
+        - XML tags <command>...</command> or <result>...</result>
+        - DONE with trailing commentary
+    """
+    if not reply:
+        return None, None
+    for raw_line in reply.splitlines():
+        line = raw_line.strip()
+        if line == "DONE":
+            return "done", None
+    m = re.search(r"```(?:bash|sh)?\s*(.*?)\s*```", reply, re.DOTALL)
+    if m:
+        c = m.group(1).strip()
+        if c:
+            return "run", c
+    m = re.search(
+        r"<(?:command|result)>\s*(.*?)\s*</(?:command|result)>", reply, re.DOTALL
+    )
+    if m:
+        c = m.group(1).strip()
+        if c:
+            return "run", c
+    if "RUN:" in reply:
+        idx = reply.index("RUN:") + 4
+        cmd = reply[idx:].strip()
+        if cmd.endswith("```"):
+            cmd = cmd[:-3].strip()
+        if cmd:
+            return "run", cmd
+    return None, None
 
 
-# ---------- sandbox ----------
-
-# Only the toolchain is mounted. Binding "/" read-only would still expose every
-# readable file on the machine (ssh keys, tokens, browser profiles).
+# Host files needed inside the sandbox for standard library name resolution,
+# timezone data, and dynamic linker operation. Read-only.
 ETC_FILES = [
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
     "/etc/passwd",
     "/etc/group",
-    "/etc/nsswitch.conf",
-    "/etc/hosts",
-    "/etc/hostname",
-    "/etc/resolv.conf",
-    "/etc/localtime",
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
@@ -119,7 +138,7 @@ ETC_FILES = [
 OUTPUT_CAP = 4096  # bytes of command output shown to the model
 
 
-def bwrap_cmd(workdir, inner, outdir=None):
+def bwrap_cmd(workdir, cmd_args, outdir=None):
     """Filesystem + network isolation with a curated, read-only toolchain."""
     args = ["bwrap", "--ro-bind", "/usr", "/usr"]
     for name in ("bin", "sbin", "lib", "lib64"):
@@ -162,32 +181,44 @@ def bwrap_cmd(workdir, inner, outdir=None):
         "--die-with-parent",
         "--new-session",
         "--",
-        "bash",
-        "-c",
-        inner,
+        *cmd_args,
     ]
     return args
 
 
-def run_sandboxed(workdir, inner, timeout, outdir=None):
-    """Run under bwrap. Output is written to disk in the sandbox and only its
-    tail is read back, so a runaway command cannot exhaust host memory."""
-    outdir = outdir or tempfile.mkdtemp(prefix="bench-out-")
+def run_sandboxed(workdir, cmd, timeout, outdir=None):
+    """Run under bwrap. The command is written to an isolated runner script
+    to preserve heredocs, multiline syntax, quotes, and exit codes without
+    any shell concatenation."""
+    cleanup_outdir = False
+    if not outdir:
+        outdir = tempfile.mkdtemp(prefix="bench-out-")
+        cleanup_outdir = True
     os.makedirs(outdir, exist_ok=True)
     stdout_path = os.path.join(outdir, "stdout")
     rc_path = os.path.join(outdir, "rc")
-    for path in (stdout_path, rc_path):
+    script_path = os.path.join(outdir, "run.sh")
+    for path in (stdout_path, rc_path, script_path):
         if os.path.exists(path):
             os.remove(path)
-    # -t cpu seconds, -f file size, -u process count
-    wrapped = (
-        "ulimit -t 120 2>/dev/null; ulimit -f 16384 2>/dev/null; "
-        "ulimit -u 512 2>/dev/null; "
-        f"( {{ {inner} ; }} ) > /mnt/out/stdout 2>&1; echo $? > /mnt/out/rc"
+
+    normalized_cmd = cmd.rstrip("\r\n") + "\n"
+    script_content = (
+        "#!/usr/bin/env bash\n"
+        "exec > /mnt/out/stdout 2>&1\n"
+        "ulimit -t 120 2>/dev/null || true\n"
+        "ulimit -f 16384 2>/dev/null || true\n"
+        "ulimit -u 512 2>/dev/null || true\n"
+        "trap 'echo $? > /mnt/out/rc' EXIT\n"
+        f"{normalized_cmd}"
     )
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_content)
+    os.chmod(script_path, 0o755)
+
     try:
         proc = subprocess.run(
-            bwrap_cmd(workdir, wrapped, outdir),
+            bwrap_cmd(workdir, ["bash", "/mnt/out/run.sh"], outdir),
             capture_output=True,
             timeout=timeout,
             env={
@@ -197,18 +228,28 @@ def run_sandboxed(workdir, inner, timeout, outdir=None):
             },
         )
     except subprocess.TimeoutExpired:
+        if cleanup_outdir:
+            shutil.rmtree(outdir, ignore_errors=True)
         return 124, f"<timeout after {timeout}s>"
-    try:
-        with open(rc_path) as f:
-            code = int(f.read().strip())
-    except OSError, ValueError:
+
+    code = 124
+    if os.path.exists(rc_path):
+        try:
+            with open(rc_path) as f:
+                code = int(f.read().strip())
+        except OSError, ValueError:
+            code = 124
+    else:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         msg = (
             f"<bwrap failed ({proc.returncode}): {err}>"
             if err
             else "<killed before reporting an exit code>"
         )
+        if cleanup_outdir:
+            shutil.rmtree(outdir, ignore_errors=True)
         return proc.returncode or 124, msg
+
     text = ""
     try:
         size = os.path.getsize(stdout_path)
@@ -219,6 +260,9 @@ def run_sandboxed(workdir, inner, timeout, outdir=None):
             text += f.read().decode("utf-8", "replace")
     except OSError:
         pass
+
+    if cleanup_outdir:
+        shutil.rmtree(outdir, ignore_errors=True)
     return code, text
 
 
@@ -226,45 +270,48 @@ def run_sandboxed(workdir, inner, timeout, outdir=None):
 
 
 class VramSampler(threading.Thread):
-    def __init__(self):
+    """Background poller that tracks peak GPU memory during the run."""
+
+    def __init__(self, interval=0.1):
         super().__init__(daemon=True)
+        self.interval = interval
         self.peak = 0
         self.stop = threading.Event()
 
     def run(self):
         while not self.stop.is_set():
-            try:
-                out = subprocess.run(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                ).stdout.strip()
-                self.peak = max(self.peak, int(out.splitlines()[0]))
-            except Exception:
-                pass
-            self.stop.wait(0.5)
+            v = self._read()
+            self.peak = max(self.peak, v)
+            time.sleep(self.interval)
+
+    def _read(self):
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            return int(out.strip().splitlines()[0])
+        except Exception:
+            return 0
 
 
-# ---------- task loading ----------
+# ---------- tasks & workspaces ----------
 
 
 def load_task(task_id):
-    d = os.path.join(TASKS, task_id)
-    with open(os.path.join(d, "meta.json")) as f:
+    path = os.path.join(TASKS, task_id)
+    with open(os.path.join(path, "meta.json")) as f:
         meta = json.load(f)
-    meta["id"] = task_id
-    meta["dir"] = d
+    meta["dir"] = path
     return meta
 
 
 def all_tasks():
-    if not os.path.isdir(TASKS):
-        return []
     return sorted(
         t
         for t in os.listdir(TASKS)
@@ -276,23 +323,47 @@ SKIP_DIRS = {".git", "_hidden"}
 
 
 def snapshot(root):
-    """relpath -> sha256 of regular files only. Symlinks are never followed."""
+    """Deep structural inventory of the workspace.
+
+    Classifies files, symlinks, fifos, sockets, and special files with
+    cryptographic hashes and permissions to track agent modifications.
+    """
     out = {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d))
-        )
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in filenames:
             path = os.path.join(dirpath, name)
-            if os.path.islink(path) or not os.path.isfile(path):
+            rel = os.path.relpath(path, root)
+            try:
+                st = os.lstat(path)
+            except OSError:
                 continue
-            digest = hashlib.sha256()
-            with open(path, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    digest.update(block)
-            out[os.path.relpath(path, root)] = digest.hexdigest()
+            perm = stat.S_IMODE(st.st_mode)
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(path)
+                except OSError:
+                    target = ""
+                out[rel] = {"type": "symlink", "target": target, "perm": perm}
+            elif stat.S_ISREG(st.st_mode):
+                digest = hashlib.sha256()
+                try:
+                    with open(path, "rb") as f:
+                        for block in iter(lambda: f.read(1 << 20), b""):
+                            digest.update(block)
+                    out[rel] = {
+                        "type": "file",
+                        "sha256": digest.hexdigest(),
+                        "perm": perm,
+                    }
+                except OSError:
+                    out[rel] = {"type": "file", "sha256": "", "perm": perm}
+            elif stat.S_ISFIFO(st.st_mode):
+                out[rel] = {"type": "fifo", "perm": perm}
+            elif stat.S_ISSOCK(st.st_mode):
+                out[rel] = {"type": "socket", "perm": perm}
+            else:
+                out[rel] = {"type": "special", "perm": perm}
     return out
 
 
@@ -300,10 +371,20 @@ def clean_copy(src, dst):
     """Rebuild a workspace from regular files only, so symlinks and special
     files created by the agent can never reach the scorer."""
     os.makedirs(dst, exist_ok=True)
-    for rel in snapshot(src):
+    snap = snapshot(src)
+    for rel, info in snap.items():
+        if info.get("type") != "file":
+            continue
+        src_path = os.path.join(src, rel)
+        try:
+            st = os.lstat(src_path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                continue
+        except OSError:
+            continue
         target = os.path.join(dst, rel)
         os.makedirs(os.path.dirname(target) or dst, exist_ok=True)
-        shutil.copy2(os.path.join(src, rel), target)
+        shutil.copy2(src_path, target)
 
 
 def prepare(meta, run_dir):
@@ -355,16 +436,37 @@ def score(meta, work, run_dir):
 
 def policy_check(meta, work, run_dir):
     """Compare the workspace against the baseline taken before the agent ran.
-    Independent of git, so tampering with .git changes nothing."""
+
+    Detects unauthorized files, new symlinks, fifos, sockets, and modifications.
+    """
     with open(os.path.join(run_dir, "baseline.json")) as f:
         baseline = json.load(f)
     current = snapshot(work)
-    changed = sorted(k for k in current if k in baseline and current[k] != baseline[k])
+
+    changed = []
+    forbidden = []
+    allowed = set(meta.get("allowed_files", []))
+
+    for k, curr in current.items():
+        base = baseline.get(k)
+        if base is None:
+            if curr["type"] != "file" or (allowed and k not in allowed):
+                forbidden.append(k)
+        elif curr != base:
+            changed.append(k)
+            perm_changed = curr.get("perm") != base.get("perm")
+            if (allowed and k not in allowed) or curr["type"] != "file" or perm_changed:
+                forbidden.append(k)
+
     added = sorted(set(current) - set(baseline))
     removed = sorted(set(baseline) - set(current))
-    touched = changed + added + removed
-    allowed = set(meta.get("allowed_files", []))
-    forbidden = [p for p in touched if allowed and p not in allowed]
+    for k in removed:
+        if allowed and k not in allowed:
+            forbidden.append(k)
+
+    changed = sorted(set(changed))
+    forbidden = sorted(set(forbidden))
+
     return {
         "changed": changed,
         "added": added,
@@ -377,52 +479,13 @@ def policy_check(meta, work, run_dir):
 # ---------- agent loop ----------
 
 
-def parse_action(text):
-    """Return (kind, command). Multi-line commands (heredocs) are kept whole."""
-    if not text:
-        return None, None
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.upper().startswith("RUN:"):
-            head = s[4:].strip()
-            return "run", strip_fence("\n".join([head, *lines[i + 1 :]])).strip()
-        if s.upper().startswith("DONE"):
-            return "done", None
-    # tolerate the XML-ish action wrappers some chat templates emit
-    m = re.search(r"<(result|command|cmd|run|bash)>\s*(.+?)\s*</\1>", text, re.S | re.I)
-    if m:
-        return "run", strip_fence(m.group(2)).strip()
-    # tolerate a bare fenced bash block as a command
-    if "```" in text:
-        blocks = text.split("```")
-        for i in range(1, len(blocks), 2):
-            body = blocks[i]
-            body = body.split("\n", 1)[1] if "\n" in body else body
-            if body.strip():
-                return "run", body.strip()
-    return None, None
-
-
-def strip_fence(cmd):
-    """Drop a trailing ``` fence that closed the command block."""
-    lines = cmd.rstrip().splitlines()
-    while lines and lines[-1].strip().startswith("```"):
-        lines.pop()
-    return "\n".join(lines)
-
-
-def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall=1200):
-    run_dir = os.path.join(run_root, meta["id"])
+def run_task(meta, model, ctx, ngpu, max_steps, max_wall, run_dir, verbose=True):
+    """One run of one task. Everything needed to replicate lives in run_dir."""
     os.makedirs(run_dir, exist_ok=True)
     work = prepare(meta, run_dir)
-
-    listing = subprocess.run(
-        ["bash", "-c", "ls -R . | head -60"], cwd=work, capture_output=True, text=True
-    ).stdout
     user = (
-        f"{meta['prompt']}\n\nRepository layout:\n{listing}\n"
-        f"You have {max_steps} turns. Start by inspecting the files."
+        f"Task: {meta['instruction']}\n\n"
+        "Work in /mnt/work. The repo is already checked out."
     )
 
     msgs = [
@@ -455,6 +518,7 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
             # Thinking models can spend the whole budget reasoning and emit no
             # content. Ask again instead of burning a step on empty output.
             if kind is None and thinking and not reply.strip():
+                rem_retry = max(1, int(max_wall - (time.time() - t0)))
                 retry_msgs = [
                     *msgs,
                     {"role": "assistant", "content": thinking},
@@ -464,7 +528,9 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
                         "starting with 'RUN: ' or the single word 'DONE'.",
                     },
                 ]
-                reply, _, ntok2 = chat(model, retry_msgs, ctx, ngpu)
+                reply, _, ntok2 = chat(
+                    model, retry_msgs, ctx, ngpu, timeout=min(1800, rem_retry)
+                )
                 tokens += ntok2
                 kind, cmd = parse_action(reply)
             transcript.append(
@@ -494,7 +560,10 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
             tool_calls += 1
             budget = max(
                 1,
-                min(meta.get("cmd_timeout_s", 60), int(max_wall - (time.time() - t0))),
+                min(
+                    meta.get("cmd_timeout_s", 60),
+                    int(max_wall - (time.time() - t0)),
+                ),
             )
             code, out = run_sandboxed(
                 work, cmd, budget, os.path.join(run_dir, "cmd-out")
@@ -507,9 +576,13 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
         sampler.stop.set()
         sampler.join(timeout=3)
 
-    elapsed = time.time() - t0
+    t_agent_end = time.time()
+    agent_wall_s = t_agent_end - t0
+    t_verify_start = time.time()
     tests_ok, test_out = score(meta, work, run_dir)
     diff = policy_check(meta, work, run_dir)
+    verification_wall_s = time.time() - t_verify_start
+    total_wall_s = time.time() - t0
     passed = tests_ok and not diff["forbidden"]
 
     with open(os.path.join(run_dir, "transcript.json"), "w") as f:
@@ -524,7 +597,10 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
         "passed": passed,
         "steps": steps,
         "tokens": tokens,
-        "wall_s": round(elapsed, 1),
+        "agent_wall_s": round(agent_wall_s, 2),
+        "verification_wall_s": round(verification_wall_s, 2),
+        "total_wall_s": round(total_wall_s, 2),
+        "wall_s": round(total_wall_s, 2),
         "peak_vram_mib": sampler.peak,
         "tool_calls": tool_calls,
         "invalid_actions": invalid,
@@ -538,10 +614,14 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
         "exit": test_out.splitlines()[0] if test_out else "",
     }
     if verbose:
+        timing = (
+            f"{rec['wall_s']:6.1f}s "
+            f"(agent: {agent_wall_s:5.1f}s, verify: {verification_wall_s:4.1f}s)"
+        )
         print(
             f"  {'PASS' if passed else 'FAIL'}  {meta['id']:24s} "
-            f"{rec['wall_s']:6.1f}s {rec['steps']:2d} steps "
-            f"{rec['tokens']:6d} tok "
+            f"{timing} "
+            f"{rec['steps']:2d} steps {rec['tokens']:6d} tok "
             f"{'REGRESSION' if diff['forbidden'] else ''}"
             f"{' TIMEOUT' if timed_out else ''}"
             f"{'' if tests_ok or diff['forbidden'] else ' tests-failed'}",
@@ -550,11 +630,14 @@ def run_task(meta, model, ctx, ngpu, max_steps, run_root, verbose=True, max_wall
     return rec
 
 
+# ---------- environment & provenance ----------
+
+
 def _sh(cmd):
     try:
-        return subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30
-        ).stdout.strip()
+        return subprocess.check_output(
+            cmd, shell=True, text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except Exception:
         return ""
 
@@ -581,8 +664,8 @@ def environment():
     }
 
 
-def model_digest(model):
-    """Full manifest digest. `ollama list` only prints a 12-char prefix."""
+def model_fingerprint(model):
+    """Full manifest fingerprint: config digest, weights digest, and size."""
     name, _, tag = model.partition(":")
     tag = tag or "latest"
     root = os.path.expanduser("~/.ollama/models/manifests")
@@ -592,11 +675,34 @@ def model_digest(model):
             try:
                 with open(os.path.join(dirpath, tag)) as f:
                     data = json.load(f)
-                return data["config"]["digest"]
+                config_d = data.get("config", {}).get("digest")
+                model_layer = next(
+                    (
+                        layer
+                        for layer in data.get("layers", [])
+                        if "model" in layer.get("mediaType", "")
+                    ),
+                    {},
+                )
+                return {
+                    "config_digest": config_d,
+                    "weights_digest": model_layer.get("digest"),
+                    "weights_bytes": model_layer.get("size"),
+                }
             except Exception:
                 break
     listed = _sh(f"ollama list | awk '$1==\"{model}\"{{print $2}}'")
-    return listed + " (abbreviated)"
+    return {
+        "config_digest": listed + " (abbreviated)",
+        "weights_digest": None,
+        "weights_bytes": None,
+    }
+
+
+def model_digest(model):
+    """Convenience wrapper returning weights digest or config digest."""
+    fp = model_fingerprint(model)
+    return fp["weights_digest"] or fp["config_digest"]
 
 
 def main():
@@ -628,57 +734,60 @@ def main():
         return 1
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    run_root = os.path.join(RUNS, f"{stamp}-{args.tag or args.model.split('/')[-1]}")
-    os.makedirs(run_root, exist_ok=True)
+    tag = f"-{args.tag}" if args.tag else ""
+    run_dir = os.path.join(RUNS, f"{stamp}{tag}")
+    os.makedirs(run_dir, exist_ok=True)
 
     env = environment()
-    env["model_digest"] = model_digest(args.model)
-    env["profile"] = {
-        "model": args.model,
-        "ctx": args.ctx,
-        "ngpu": args.ngpu,
-        "steps": args.steps,
-        "repeat": args.repeat,
-    }
-    with open(os.path.join(run_root, "env.json"), "w") as f:
-        json.dump(env, f, indent=1)
+    fp = model_fingerprint(args.model)
+    env["model_fingerprint"] = fp
+    env["model_digest"] = fp["weights_digest"] or fp["config_digest"]
+
+    with open(os.path.join(run_dir, "env.json"), "w") as f:
+        json.dump(env, f, indent=2)
 
     print(
-        f"model={args.model} ctx={args.ctx} ngpu={args.ngpu} "
-        f"tasks={len(ids)} repeats={args.repeat}"
+        f"RUN {run_dir}\n"
+        f"model={args.model} ({env['model_digest']})  "
+        f"ctx={args.ctx}  ngpu={args.ngpu}  tasks={len(ids)}  repeat={args.repeat}\n"
+        f"host={env['gpu']} (driver {env['nvidia_driver']})  "
+        f"python={env['python']}\n",
+        flush=True,
     )
-    unload(args.model)
-    time.sleep(2)
 
     recs = []
     for rep in range(args.repeat):
-        for t in ids:
-            recs.append(
-                run_task(
-                    load_task(t),
-                    args.model,
-                    args.ctx,
-                    args.ngpu,
-                    args.steps,
-                    os.path.join(run_root, f"r{rep}"),
-                    max_wall=args.max_wall,
-                )
+        for tid in ids:
+            meta = load_task(tid)
+            tdir = os.path.join(run_dir, f"r{rep}", tid)
+            rec = run_task(
+                meta,
+                args.model,
+                args.ctx,
+                args.ngpu,
+                args.steps,
+                args.max_wall,
+                tdir,
             )
+            rec["repeat"] = rep
+            recs.append(rec)
 
-    with open(os.path.join(run_root, "results.json"), "w") as f:
-        json.dump(recs, f, indent=1)
+    with open(os.path.join(run_dir, "results.json"), "w") as f:
+        json.dump(recs, f, indent=2)
 
+    ok = sum(1 for r in recs if r["passed"])
     n = len(recs)
-    ok = sum(r["passed"] for r in recs)
-    hours = sum(r["wall_s"] for r in recs) / 3600 or 1e-9
+    total_h = sum(r["total_wall_s"] for r in recs) / 3600 or 1e-9
+    agent_h = sum(r["agent_wall_s"] for r in recs) / 3600 or 1e-9
+    verify_h = sum(r["verification_wall_s"] for r in recs) / 3600 or 1e-9
     print(
         f"\n{n} runs  pass={ok}/{n} ({100 * ok / n:.0f}%)  "
-        f"verified tasks/hour={ok / hours:.2f}  "
+        f"verified tasks/hour={ok / total_h:.2f}  "
+        f"(agent: {agent_h * 3600:.1f}s, verify: {verify_h * 3600:.1f}s)  "
         f"peak_vram={max(r['peak_vram_mib'] for r in recs)} MiB  "
         f"invalid_actions={sum(r['invalid_actions'] for r in recs)}"
     )
-    print(f"results: {run_root}/results.json")
-    return 0
+    return 0 if ok == n else 1
 
 
 if __name__ == "__main__":

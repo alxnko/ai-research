@@ -20,6 +20,7 @@ from bench import (
     load_task,
     parse_action,
     policy_check,
+    run_sandboxed,
     score,
     snapshot,
 )
@@ -95,8 +96,9 @@ def isolation_checks():
         failures.append("clean_copy kept a symlinked _hidden")
     if os.path.exists(os.path.join(scoring, "leaked.txt")):
         failures.append("clean_copy kept a symlinked file")
-    if "leaked.txt" in snapshot(work):
-        failures.append("snapshot followed a symlink")
+    snap = snapshot(work)
+    if snap.get("leaked.txt", {}).get("type") != "symlink":
+        failures.append("snapshot did not classify symlink correctly")
     with open(victim) as f:
         if f.read() != "ORIGINAL":
             failures.append("clean_copy wrote through a symlink")
@@ -113,6 +115,94 @@ def isolation_checks():
         failures.append("install_tests merged into an existing _hidden")
     except RuntimeError:
         pass
+    shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
+def _check_heredocs_and_quotes(work):
+    """Test heredocs, multiline execution, and quotes in sandbox."""
+    errs = []
+    heredoc_cmd = (
+        "cat > hello.py << 'EOF'\n"
+        "x = 40 + 2\n"
+        "print(f'heredoc_val={x}')\n"
+        "EOF\n"
+        "python3 hello.py"
+    )
+    code, out = run_sandboxed(work, heredoc_cmd, timeout=15)
+    if code != 0 or "heredoc_val=42" not in out:
+        errs.append(f"heredoc execution failed ({code}): {out}")
+    elif not os.path.exists(os.path.join(work, "hello.py")):
+        errs.append("heredoc did not persist generated file")
+
+    multiline_cmd = "echo 'line 1'\necho 'line 2'"
+    code, out = run_sandboxed(work, multiline_cmd, timeout=15)
+    if code != 0 or "line 1" not in out or "line 2" not in out:
+        errs.append(f"multiline execution failed ({code}): {out}")
+
+    quote_cmd = "echo 'quotes and \"double\" quotes'"
+    code, out = run_sandboxed(work, quote_cmd, timeout=15)
+    if code != 0 or 'quotes and "double" quotes' not in out:
+        errs.append(f"quote execution failed ({code}): {out}")
+
+    code, out = run_sandboxed(work, "echo 'error message' >&2; exit 42", timeout=15)
+    if code != 42 or "error message" not in out:
+        errs.append(f"exit code or stderr propagation failed ({code}): {out}")
+
+    code, out = run_sandboxed(work, "sleep 5", timeout=1)
+    if code != 124 or "timeout after 1s" not in out:
+        errs.append(f"command timeout handling failed ({code}): {out}")
+
+    return errs
+
+
+def _check_sandbox_policy(tmp, work):
+    """Test policy check and clean copy against symlinks and fifos."""
+    errs = []
+    leak_target = f"/tmp/bench_host_leak_check_{os.getpid()}"
+    if os.path.exists(leak_target):
+        os.remove(leak_target)
+    run_sandboxed(work, f"touch {leak_target}", timeout=10)
+    if os.path.exists(leak_target):
+        errs.append("host isolation breached: sandbox wrote to host /tmp")
+        os.remove(leak_target)
+
+    with open(os.path.join(work, "base.txt"), "w") as f:
+        f.write("base")
+    with open(os.path.join(tmp, "baseline.json"), "w") as f:
+        json.dump(snapshot(work), f)
+
+    meta = {"allowed_files": ["base.txt"]}
+    os.symlink("/etc/passwd", os.path.join(work, "leak.lnk"))
+    diff = policy_check(meta, work, tmp)
+    if "leak.lnk" not in diff["forbidden"]:
+        errs.append("policy_check failed to detect symlink as forbidden")
+
+    fifo_path = os.path.join(work, "test_fifo")
+    try:
+        os.mkfifo(fifo_path)
+        diff = policy_check(meta, work, tmp)
+        if "test_fifo" not in diff["forbidden"]:
+            errs.append("policy_check failed to detect FIFO as forbidden")
+        clean_dst = os.path.join(tmp, "clean_test")
+        clean_copy(work, clean_dst)
+        if os.path.exists(os.path.join(clean_dst, "test_fifo")):
+            errs.append("clean_copy copied a FIFO")
+        if os.path.exists(os.path.join(clean_dst, "leak.lnk")):
+            errs.append("clean_copy copied a symlink")
+    except OSError:
+        pass
+    return errs
+
+
+def sandbox_regression_checks():
+    """Exercise sandboxed execution directly against real shell edge cases."""
+    tmp = tempfile.mkdtemp(prefix="bench-sandbox-reg-")
+    work = os.path.join(tmp, "work")
+    os.makedirs(work, exist_ok=True)
+    failures = []
+    failures.extend(_check_heredocs_and_quotes(work))
+    failures.extend(_check_sandbox_policy(tmp, work))
     shutil.rmtree(tmp, ignore_errors=True)
     return failures
 
@@ -143,6 +233,8 @@ def main():
         failures.append(("parse_action", "parser regression", ""))
     for problem in isolation_checks():
         failures.append(("isolation", problem, ""))
+    for problem in sandbox_regression_checks():
+        failures.append(("sandbox_regression", problem, ""))
     ids = all_tasks()
     # Tasks are independent: build workspaces in parallel, report in order.
     workers = min(8, len(ids) or 1)
