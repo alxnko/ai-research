@@ -28,7 +28,7 @@ import urllib.request
 # unless it is bound explicitly.
 PYTHON_HOME = os.environ.get(
     "BENCH_PYTHON_HOME",
-    "/home/alxnko/.local/share/uv/python/cpython-3.15.2-linux-x86_64-gnu",
+    os.path.dirname(os.path.dirname(os.path.realpath(sys.executable))),
 )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
