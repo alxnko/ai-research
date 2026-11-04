@@ -22,6 +22,21 @@ model digest and server settings alongside the numbers.
 
 See `bench/README.md` for usage and task authoring.
 
+## Benchmark versions
+
+**v0 (commit `3e9d40b`) — pilot.** The first 24-task suite. Known defects, fixed
+in v0.1 but kept frozen so pilot numbers stay comparable:
+
+- the task set is Python standard-library logic in all six categories; it is
+  cross-domain programming logic, not native frontend, Android or React work;
+- the scorer copied hidden tests into an agent-writable directory, so a
+  symlinked `_hidden` could redirect writes onto the host;
+- `passed` ignored forbidden file changes, and regression detection missed
+  untracked files;
+- no per-task wall-clock, memory or output cap;
+- the sandbox exposed the whole host filesystem read-only, not just the
+  toolchain it needs.
+
 ## Status
 
 - Benchmark harness: complete, self-checked (every task fails unsolved and
@@ -40,4 +55,4 @@ reasoning loops rather than adding general capability.
 
 ## License
 
-Not yet chosen.
+Apache-2.0. See `LICENSE`.
