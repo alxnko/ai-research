@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "Paginate with validation",
+  "prompt": "Implement paginate() in api.py.\n\nSignature: paginate(items, page, per_page) -> dict\n\nReturn a dict with keys: items (the slice), page, per_page, total, pages, has_next, has_prev.\npages = ceil(total / per_page), and 0 when total == 0.\nhas_next is True when page < pages; has_prev is True when page > 1 and pages > 0.\n\nValidation (raise ValueError with a message containing the field name):\n- page < 1 is invalid\n- per_page < 1 or per_page > 100 is invalid\n- a page beyond the last page is valid and returns an empty items list\n\nDo not mutate the input list.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 120,
+  "cmd_timeout_s": 60,
+  "allowed_files": ["api.py"]
+}

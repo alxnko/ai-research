@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "Webhook signature verification",
+  "prompt": "Implement webhook.py for the payments integration.\n\nverify(headers, body, secret, now, tolerance=300) returns a dict\n{'event_id':..., 'event':...} for an authentic request, else None.\n\nHeaders are a case-insensitive dict-like object of strings. Required:\n- 'X-Signature': 'sha256=<hex hmac>' of the string '<timestamp>.<raw body>'\n  using the secret bytes as key.\n- 'X-Timestamp': integer seconds, within tolerance of now in either direction.\nBody is either bytes or str; str is encoded as UTF-8 before signing.\n\nReject when: a header is missing, the signature scheme is not sha256, the hex is\nbad, the timestamp is not an integer, the timestamp is outside tolerance, the\nsignature does not match, or the body is not valid JSON or lacks an 'id' key.\nComparison must be constant-time.\n\nReturned 'event' is the parsed JSON object.\n\nOnly webhook.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["webhook.py"]
+}

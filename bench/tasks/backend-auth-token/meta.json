@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "Signed expiring tokens",
+  "prompt": "Implement tokens.py.\n\nissue(uid, roles, now, ttl=3600) returns a token string of the form\n'<payload_b64>.<sig>', where payload_b64 is the URL-safe base64 (no padding)\nof the JSON bytes {'uid': uid, 'roles': sorted(roles), 'exp': now + ttl}\nwith keys sorted and separators (',', ':'). sig is the hex HMAC-SHA256 of the\npayload_b64 string using SECRET as key.\n\nverify(token, now) returns a dict {'uid':..., 'roles': [...]} for a valid,\nunexpired token, and None for anything invalid: malformed shape, bad base64,\nbad JSON, wrong signature, or now >= exp.\n\nSignature comparison must be constant-time. Roles must come back as a sorted\nlist. Tokens must not be forgeable by editing the payload.\n\nOnly tokens.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["tokens.py"]
+}

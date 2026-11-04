@@ -1,0 +1,9 @@
+{
+  "category": "devops",
+  "title": "Health-check retry helper",
+  "prompt": "check.sh must probe a script and retry with backoff.\n\nUsage: ./check.sh <command> [attempts] [sleep_seconds]\n\nBehaviour:\n- attempts defaults to 3, sleep_seconds defaults to 0. Both must be\n  non-negative integers; attempts must be at least 1, else exit 2 with a\n  message on stderr.\n- It runs the command with `sh -c`. On success (exit 0) it prints 'ok' and\n  exits 0 immediately.\n- On failure it retries until attempts are exhausted, printing 'fail' and\n  exiting 1.\n- It prints one line per attempt to stderr: 'attempt N/<attempts>: <exit code>'.\n- The command receives no stdin and cannot hang the script.\n- A missing command argument exits 2.\n\nA test helper counts invocations to prove the retry count.\n\nOnly check.sh should change.",
+  "test_cmd": "bash _hidden/test_check.sh",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["check.sh"]
+}

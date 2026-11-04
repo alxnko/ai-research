@@ -1,0 +1,9 @@
+{
+  "category": "refactoring",
+  "title": "Unify duplicated phone normalisation",
+  "prompt": "contacts.py has two near-identical phone normalisers used by different\ncode paths. Refactor so exactly one implementation, named normalize_phone,\ndoes the work.\n\nRequirements:\n- normalize_phone(value) must exist and implement the existing behaviour exactly.\n- normalize_home and normalize_work must keep their public names and signatures\n  and must delegate to normalize_phone.\n- format_contact must keep returning the same dict as before.\n- Behaviour must not change for any input, including invalid ones.\n\nOnly contacts.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 120,
+  "cmd_timeout_s": 60,
+  "allowed_files": ["contacts.py"]
+}

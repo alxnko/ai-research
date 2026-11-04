@@ -1,0 +1,9 @@
+{
+  "category": "mobile",
+  "title": "Deep-link route matcher",
+  "prompt": "Implement router.py for the mobile app's deep links.\n\nRouter(routes) takes a list of (pattern, name) pairs where a pattern looks like\n'/orders/:id/items/:item'. Router.match(path) returns a dict\n{'name': name, 'params': {...}} for the first matching pattern, or None.\n\nRules:\n- Segments starting with ':' capture one non-empty segment.\n- '*' matches exactly one non-empty segment and is captured under key '*'.\n- Matching is exact on segment count; trailing slashes are ignored on both\n  pattern and path; query strings are ignored.\n- Captured values are percent-decoded.\n- Registering the same pattern twice raises ValueError.\n- Patterns must start with '/' or ValueError is raised at construction.\n\nOnly router.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["router.py"]
+}

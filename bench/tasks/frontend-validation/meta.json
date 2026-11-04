@@ -1,0 +1,9 @@
+{
+  "category": "frontend",
+  "title": "Signup form validation module",
+  "prompt": "Implement form validation in validate.py.\n\nvalidate(fields) receives a dict and returns a dict mapping field name to an\nerror string. Only fields with errors appear in the result. It must never raise,\neven for None or non-string values.\n\nRules:\n- email: required; after trimming must look like local@domain.tld (one '@',\n  non-empty local part, and a dot in the domain).\n- password: required; at least 10 characters; must contain a letter and a digit.\n- age: required; must be an int (not bool) between 13 and 120 inclusive.\n- name: optional; when present must be a string of 1-80 characters after\n  trimming. Empty/whitespace-only name is allowed and not an error.\n- Unknown fields are ignored.\n\nclean(fields) returns only the four known fields, with email trimmed and\nlowercased and name trimmed. Fields absent from the input are absent from the\nresult. It never raises.\n\nOnly validate.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["validate.py"]
+}

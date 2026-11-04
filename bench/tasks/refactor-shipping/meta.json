@@ -1,0 +1,9 @@
+{
+  "category": "refactoring",
+  "title": "Collapse three shipping-cost branches",
+  "prompt": "shipping.py computes shipping cost three times, once per carrier, with\ncopy-pasted logic that already drifted apart. Unify it.\n\nRequirements:\n- quote(carrier, weight_kg, express) must exist and return the same result the\n  current per-carrier functions return for every input.\n- quote_us, quote_eu and quote_apac must keep their names and signatures and\n  must delegate to quote.\n- Unknown carriers keep the current behaviour.\n- No behaviour change for any input, including invalid ones (negative weight,\n  unknown carrier, None).\n\nOnly shipping.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["shipping.py"]
+}

@@ -1,0 +1,9 @@
+{
+  "category": "devops",
+  "title": "Log rotation script",
+  "prompt": "rotate.sh does not work. Rewrite it.\n\nUsage: ./rotate.sh <logfile> [keep]\n\nBehaviour:\n- keep defaults to 3 and must be a positive integer, else print an error to\n  stderr and exit 2.\n- A missing operand or an unreadable logfile must print an error to stderr and\n  exit 2.\n- It shifts existing archives up by one: <logfile>.2 -> <logfile>.3, .1 -> .2,\n  and the live file becomes <logfile>.1. Archives numbered >= keep are deleted.\n- After rotation the live logfile exists and is empty, and its permissions match\n  the original file.\n- It must exit non-zero when any command fails, and must handle paths containing\n  spaces.\n- Rotation must be safe to run repeatedly.\n\nOnly rotate.sh should change.",
+  "test_cmd": "bash _hidden/test_rotate.sh",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["rotate.sh"]
+}

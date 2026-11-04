@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "Idempotent request handler",
+  "prompt": "Implement the idempotency layer in idem.py.\n\nrun_once(store, key, fn) executes fn() for a new key and returns its result. For\na key seen before it returns the stored result and does not call fn again.\n\nIf fn raises, the exception propagates and nothing is stored, so a retry with\nthe same key runs fn again.\n\nConcurrent callers with the same key must run fn exactly once: the second caller\nwaits for the first and then receives the same result (or the same exception\nre-raised). fn must never run twice for one key, even under threads.\n\nStore is any mutable mapping the caller passes in. Results may be any object.\n\nOnly idem.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["idem.py"]
+}

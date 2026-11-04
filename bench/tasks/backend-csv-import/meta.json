@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "CSV import with dedupe and rejection report",
+  "prompt": "Implement import_users in importer.py.\n\nimport_users(text) parses CSV text with a header row containing 'email' and\n'name' (any order, extra columns ignored) and returns a dict\n{'accepted': [...], 'rejected': [...]}.\n\nEach accepted item is {'email': lowercased trimmed email, 'name': trimmed name}.\nEach rejected item is {'row': 1-based data row number, 'reason': code} where\ncode is one of 'missing_email', 'bad_email', 'duplicate', 'missing_name'.\n\nRules in this order per row:\n- blank lines are skipped and do not count as rows.\n- email is required and must contain exactly one '@' with a non-empty local part\n  and a dot in the domain; otherwise 'bad_email' (or 'missing_email' if empty).\n- name is required after trimming, else 'missing_name'.\n- the same email twice (case-insensitive, trimmed) is a duplicate: the first\n  wins and later ones are 'duplicate'.\n- A header without one of the required columns raises ValueError.\n\nOnly importer.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["importer.py"]
+}

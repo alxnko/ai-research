@@ -1,0 +1,9 @@
+{
+  "category": "refactoring",
+  "title": "Merge duplicated config parsers",
+  "prompt": "config.py has two parsers with near-identical token handling: one for\n'key=value' lines and one for 'key: value' lines. Merge them into a single\nimplementation, parse_kv(text, sep), and keep both public wrappers.\n\nRequirements:\n- parse_kv(text, sep) parses text into a dict.\n- parse_equals(text) and parse_colon(text) keep their names and signatures and\n  must delegate to parse_kv.\n- Behaviour must not change: blank lines and lines starting with '#' are\n  skipped, surrounding whitespace is stripped from keys and values, the first\n  separator splits, later separators stay in the value, and a line without the\n  separator is an error.\n\nOnly config.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["config.py"]
+}

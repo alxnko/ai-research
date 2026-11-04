@@ -1,0 +1,9 @@
+{
+  "category": "mobile",
+  "title": "Offline sync queue",
+  "prompt": "Implement the offline sync queue in queue.py.\n\nThis queue backs the mobile client's offline cache. Mutations made while offline\nare queued and replayed in order once connectivity returns.\n\nSyncQueue() must provide:\n- push(kind, payload=None) -> the new mutation's id (a string, unique in this queue)\n- pending() -> list of dicts {id, kind, payload}, oldest first. Must be a copy:\n  mutating the returned list or its dicts must not affect the queue.\n- ack(mutation_id) -> remove that mutation; True if it existed, else False.\n- retry(mutation_id) -> move that mutation to the end of the queue; True if it\n  existed, else False.\n- __len__() -> number queued.\n- to_dict() -> JSON-serialisable plain data.\n\nAlso provide from_dict(data) which rebuilds an equal queue. After a\nround-trip through JSON the queue must contain the same pending() mutations in\nthe same order, and ids handed out later must never collide with restored ones.\nIDs must also stay unique after ack/retry churn.\n\nOnly queue.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["queue.py"]
+}

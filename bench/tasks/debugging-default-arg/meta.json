@@ -1,0 +1,9 @@
+{
+  "category": "debugging",
+  "title": "History leaks between requests",
+  "prompt": "test_given.py fails. Find the bug in cache.py and fix it.\n\nSessionCache stores per-session message history. Each new cache must start with\nempty history, and separate caches must never share state. snapshot() must\nreturn a copy that callers can mutate without affecting the cache.\n\nOnly cache.py should change. Keep the public API the same.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["cache.py"]
+}

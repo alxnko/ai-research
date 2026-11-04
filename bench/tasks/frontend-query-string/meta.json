@@ -1,0 +1,9 @@
+{
+  "category": "frontend",
+  "title": "URL query string round-trip",
+  "prompt": "Implement query.py for the web client's filter state.\n\nparse(qs) turns a query string (with or without a leading '?') into a dict.\n- Repeated keys collect into a list, in order.\n- Keys without '=' map to ''.\n- Percent escapes and '+' are decoded; malformed escapes must not raise, they\n  are kept literally.\n- An empty or None input gives {}.\n\nbuild(params) turns a dict back into a query string without the leading '?'.\n- Keys are sorted for stable output.\n- Lists become repeated keys.\n- None values are skipped.\n- Values are percent-encoded, spaces as '+'.\n\nmerge(existing_qs, updates) returns a new query string: existing pairs keep their\norder, updated keys move to the end with the new value, and a value of None\nremoves the key.\n\nOnly query.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["query.py"]
+}

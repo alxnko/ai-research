@@ -1,0 +1,9 @@
+{
+  "category": "backend",
+  "title": "Sliding-window rate limiter",
+  "prompt": "Implement RateLimiter in ratelimit.py.\n\nRateLimiter(limit, window) allows at most `limit` events per key in any\nwindow-length interval measured on a caller-supplied clock.\n\nallow(key, now) returns True and records the event when the key has fewer than\n`limit` events with timestamp > now - window; otherwise it returns False and\nrecords nothing.\n\nremaining(key, now) returns how many more events the key may record right now.\nreset_at(key, now) returns the timestamp at which the oldest live event expires,\nor None when the key has no live events.\n\nEvents are per key: one key's traffic must never affect another's. Events exactly\n`window` old must no longer count. Memory must not grow without bound when a key\nstops being used: state older than the window is dropped on access.\n\nOnly ratelimit.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["ratelimit.py"]
+}

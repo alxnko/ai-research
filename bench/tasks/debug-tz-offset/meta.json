@@ -1,0 +1,9 @@
+{
+  "category": "debugging",
+  "title": "Fix offset formatting in timestamp helper",
+  "prompt": "test_given.py fails. Find the bug in timeutil.py and fix it.\n\nformat_offset(minutes) must render a UTC offset as '+HH:MM' or '-HH:MM',\nwith minutes zero-padded, and 'Z' for an offset of 0.\nto_local_iso(epoch_seconds, offset_minutes) must return\n'YYYY-MM-DDTHH:MM:SS+HH:MM' computed in that offset (or 'Z' suffix).\n\nOnly timeutil.py should change. Keep the public function names.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 120,
+  "cmd_timeout_s": 60,
+  "allowed_files": ["timeutil.py"]
+}

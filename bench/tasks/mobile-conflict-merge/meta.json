@@ -1,0 +1,9 @@
+{
+  "category": "mobile",
+  "title": "Offline sync conflict resolution",
+  "prompt": "Implement merge.py for the mobile client's sync layer.\n\nRecords arrive from the device and from the server as dicts with keys 'id',\n'updated_at' (integer, higher is newer) and 'fields' (dict).\n\nmerge(local, remote) returns one record per id:\n- ids present only on one side are kept as-is (copied, not aliased).\n- when both sides have a record, the newer updated_at wins wholesale.\n- on an exact timestamp tie, the server record wins and 'conflict' is set True\n  on the result; non-tied results never carry a 'conflict' key.\n\nmerge_all(local_list, remote_list) applies merge pairwise and returns a list\nsorted by id ascending. Duplicate ids inside one input keep the one with the\nhighest updated_at.\n\nInputs must not be mutated.\n\nOnly merge.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["merge.py"]
+}

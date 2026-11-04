@@ -1,0 +1,9 @@
+{
+  "category": "debugging",
+  "title": "Directory listing sorts wrongly",
+  "prompt": "test_given.py fails. Fix sort_names in names.py.\n\nRequirements:\n- Case-insensitive primary ordering, using Unicode normalisation so that\n  composed and decomposed accents compare equal.\n- Ties broken by the exact original string, so ordering is deterministic.\n- Accented and non-ASCII names must sort next to their base letters, not at the\n  end, and must never raise.\n- Items that are not strings are rejected with TypeError.\n- Input must not be mutated.\n\nOnly names.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["names.py"]
+}

@@ -1,0 +1,9 @@
+{
+  "category": "frontend",
+  "title": "CSS custom-property resolver",
+  "prompt": "Implement resolve in theme.py for the design-token build step.\n\nresolve(tokens, name) returns the final value for a custom property.\n\ntokens maps property names (with the leading '--') to raw values. Values may\nreference other properties with var(--name) or var(--name, fallback).\n\nRules:\n- Resolve chains until a concrete value is reached.\n- Use the fallback when the referenced name is unknown.\n- A cycle raises ValueError, mentioning 'cycle'.\n- An unknown name with no fallback, or the name itself unknown, raises KeyError.\n- Whitespace around the resolved value is stripped.\n- A value may contain several var() references; each is substituted.\n- Nested fallbacks are supported, e.g. var(--a, var(--b, red)).\n\nOnly theme.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["theme.py"]
+}

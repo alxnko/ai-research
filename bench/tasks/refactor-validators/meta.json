@@ -1,0 +1,9 @@
+{
+  "category": "refactoring",
+  "title": "Deduplicate three field validators",
+  "prompt": "validators.py has three validators with duplicated length and type\nchecks. Extract one shared helper and reuse it.\n\nRequirements:\n- validate_name, validate_username and validate_bio must keep their names,\n  signatures and exact behaviour, including their error messages.\n- One private helper, _check_text, must perform the shared type and length\n  checks, and all three validators must call it.\n- Errors are raised as ValidationError with the same messages as before.\n\nCurrent behaviour (preserve exactly):\n- name: must be a str, 1-80 chars, else ValidationError('name must be text') or\n  ValidationError('name length must be 1-80').\n- username: must be a str, 3-20 chars, else ValidationError('username must be\n  text') or ValidationError('username length must be 3-20').\n- bio: must be a str, 0-280 chars, else ValidationError('bio must be text') or\n  ValidationError('bio length must be 0-280').\nEach returns the stripped value on success.\n\nOnly validators.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["validators.py"]
+}

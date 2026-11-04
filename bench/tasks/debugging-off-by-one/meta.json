@@ -1,0 +1,9 @@
+{
+  "category": "debugging",
+  "title": "Last chunk is dropped in uploader",
+  "prompt": "test_given.py fails. Find the bug in chunker.py and fix it.\n\nchunks(data, size) splits a bytes-like value into consecutive chunks of at most\n`size` bytes, in order, with no bytes lost and none duplicated. The final chunk\nmay be shorter. Empty input yields no chunks. size must be a positive int, else\nValueError.\n\nOnly chunker.py should change.",
+  "test_cmd": "python3 -m unittest discover -s _hidden -t . -q",
+  "timeout_s": 60,
+  "cmd_timeout_s": 30,
+  "allowed_files": ["chunker.py"]
+}
