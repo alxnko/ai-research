@@ -13,6 +13,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+import bench
 from bench import (
     all_tasks,
     clean_copy,
@@ -120,7 +121,7 @@ def isolation_checks():
 
 
 def _check_heredocs_and_quotes(work):
-    """Test heredocs, multiline execution, and quotes in sandbox."""
+    """Test heredocs, multiline execution, quotes, and trap handling."""
     errs = []
     heredoc_cmd = (
         "cat > hello.py << 'EOF'\n"
@@ -145,9 +146,13 @@ def _check_heredocs_and_quotes(work):
     if code != 0 or 'quotes and "double" quotes' not in out:
         errs.append(f"quote execution failed ({code}): {out}")
 
-    code, out = run_sandboxed(work, "echo 'error message' >&2; exit 42", timeout=15)
-    if code != 42 or "error message" not in out:
-        errs.append(f"exit code or stderr propagation failed ({code}): {out}")
+    # Verify exit status is authoritative even if command clears or overrides traps
+    trap_cmd = "trap '' EXIT; echo 'trap cleared' >&2; exit 42"
+    code, out = run_sandboxed(work, trap_cmd, timeout=15)
+    if code != 42 or "trap cleared" not in out:
+        errs.append(
+            f"exit code or stderr propagation with cleared trap failed ({code}): {out}"
+        )
 
     code, out = run_sandboxed(work, "sleep 5", timeout=1)
     if code != 124 or "timeout after 1s" not in out:
@@ -157,7 +162,7 @@ def _check_heredocs_and_quotes(work):
 
 
 def _check_sandbox_policy(tmp, work):
-    """Test policy check and clean copy against symlinks and fifos."""
+    """Test policy check and clean copy against symlinks, dirs, and fifos."""
     errs = []
     leak_target = f"/tmp/bench_host_leak_check_{os.getpid()}"
     if os.path.exists(leak_target):
@@ -167,17 +172,41 @@ def _check_sandbox_policy(tmp, work):
         errs.append("host isolation breached: sandbox wrote to host /tmp")
         os.remove(leak_target)
 
-    with open(os.path.join(work, "base.txt"), "w") as f:
+    # Establish baseline
+    base_file = os.path.join(work, "base.txt")
+    with open(base_file, "w") as f:
         f.write("base")
+    sub_dir = os.path.join(work, "sub_dir")
+    os.makedirs(sub_dir, exist_ok=True)
+    with open(os.path.join(sub_dir, "inner.txt"), "w") as f:
+        f.write("inner")
     with open(os.path.join(tmp, "baseline.json"), "w") as f:
         json.dump(snapshot(work), f)
 
-    meta = {"allowed_files": ["base.txt"]}
-    os.symlink("/etc/passwd", os.path.join(work, "leak.lnk"))
-    diff = policy_check(meta, work, tmp)
-    if "leak.lnk" not in diff["forbidden"]:
-        errs.append("policy_check failed to detect symlink as forbidden")
+    meta = {"allowed_files": ["base.txt", "sub_dir", "sub_dir/inner.txt"]}
 
+    # 1. Symlink to file
+    file_symlink = os.path.join(work, "leak_file.lnk")
+    os.symlink("/etc/passwd", file_symlink)
+    diff = policy_check(meta, work, tmp)
+    if "leak_file.lnk" not in diff["forbidden"]:
+        errs.append("policy_check failed to detect file symlink as forbidden")
+
+    # 2. Symlink to directory
+    dir_symlink = os.path.join(work, "leak_dir.lnk")
+    os.symlink("/usr", dir_symlink)
+    diff = policy_check(meta, work, tmp)
+    if "leak_dir.lnk" not in diff["forbidden"]:
+        errs.append("policy_check failed to detect directory symlink as forbidden")
+
+    # 3. Directory permission change
+    os.chmod(sub_dir, 0o777)
+    diff = policy_check(meta, work, tmp)
+    if "sub_dir" not in diff["forbidden"]:
+        errs.append("policy_check failed to detect directory permission change")
+    os.chmod(sub_dir, 0o755)
+
+    # 4. FIFO detection and clean_copy refusal
     fifo_path = os.path.join(work, "test_fifo")
     try:
         os.mkfifo(fifo_path)
@@ -188,8 +217,10 @@ def _check_sandbox_policy(tmp, work):
         clean_copy(work, clean_dst)
         if os.path.exists(os.path.join(clean_dst, "test_fifo")):
             errs.append("clean_copy copied a FIFO")
-        if os.path.exists(os.path.join(clean_dst, "leak.lnk")):
-            errs.append("clean_copy copied a symlink")
+        if os.path.exists(os.path.join(clean_dst, "leak_file.lnk")):
+            errs.append("clean_copy copied a file symlink")
+        if os.path.exists(os.path.join(clean_dst, "leak_dir.lnk")):
+            errs.append("clean_copy copied a directory symlink")
     except OSError:
         pass
     return errs
@@ -204,6 +235,67 @@ def sandbox_regression_checks():
     failures.extend(_check_heredocs_and_quotes(work))
     failures.extend(_check_sandbox_policy(tmp, work))
     shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
+def runner_smoke_test():
+    """CI smoke test: executes run_task end-to-end with a mocked model
+    in the real bubblewrap sandbox, validating that metadata, run_task,
+    scoring, and provenance records operate without runtime regressions."""
+    step = 0
+
+    def mock_chat(model, msgs, ctx, ngpu, timeout=1800):
+        nonlocal step
+        step += 1
+        if step == 1:
+            return "RUN: cat cache.py", "", 10
+        if step == 2:
+            sol_path = os.path.join(
+                ROOT, "tasks", "debugging-default-arg", "solution", "cache.py"
+            )
+            with open(sol_path) as sf:
+                sol = sf.read()
+            fix = f'RUN: cat > cache.py << "EOF"\n{sol}\nEOF\n'
+            return fix, "", 25
+        return "DONE", "", 5
+
+    tmp = tempfile.mkdtemp(prefix="bench-runner-smoke-")
+    failures = []
+    try:
+        meta = load_task("debugging-default-arg")
+        rec = bench.run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=5,
+            max_wall=60,
+            run_dir=os.path.join(tmp, "run_0"),
+            verbose=False,
+            chat_fn=mock_chat,
+        )
+        if not rec["passed"]:
+            failures.append(("runner_smoke_test", "mocked run failed", str(rec)))
+        if rec["task"] != "debugging-default-arg":
+            failures.append(
+                ("runner_smoke_test", "task id mismatch in record", str(rec))
+            )
+        if rec["steps"] != 3:
+            failures.append(
+                ("runner_smoke_test", f"expected 3 steps, got {rec['steps']}", "")
+            )
+        if rec["agent_wall_s"] <= 0 or rec["total_wall_s"] <= 0:
+            failures.append(
+                ("runner_smoke_test", "timing metrics not populated", str(rec))
+            )
+        if not os.path.exists(os.path.join(tmp, "run_0", "transcript.json")):
+            failures.append(("runner_smoke_test", "transcript.json not written", ""))
+        if not os.path.exists(os.path.join(tmp, "run_0", "baseline.json")):
+            failures.append(("runner_smoke_test", "baseline.json not written", ""))
+    except Exception as e:
+        failures.append(("runner_smoke_test", f"exception during run_task: {e}", ""))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return failures
 
 
@@ -235,6 +327,9 @@ def main():
         failures.append(("isolation", problem, ""))
     for problem in sandbox_regression_checks():
         failures.append(("sandbox_regression", problem, ""))
+    for item in runner_smoke_test():
+        failures.append(item)
+
     ids = all_tasks()
     # Tasks are independent: build workspaces in parallel, report in order.
     workers = min(8, len(ids) or 1)
@@ -249,7 +344,8 @@ def main():
         for tid, why, out in failures:
             print(f"\n{tid}: {why}\n{out}")
         return 1
-    print(f"\n{len(all_tasks())} tasks verified: unsolved fail, solutions pass")
+    total = len(all_tasks())
+    print(f"\n{total} tasks verified + smoke test: unsolved fail, solutions pass")
     return 0
 
 
