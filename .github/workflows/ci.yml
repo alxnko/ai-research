@@ -14,8 +14,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install and configure bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo chmod u+s /usr/bin/bwrap || true
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
@@ -34,4 +38,4 @@ jobs:
         run: uvx ty check
 
       - name: Harness Self-Check
-        run: python3 bench/selfcheck.py
+        run: uv run python bench/selfcheck.py

@@ -186,7 +186,7 @@ def run_sandboxed(workdir, inner, timeout, outdir=None):
         f"( {{ {inner} ; }} ) > /mnt/out/stdout 2>&1; echo $? > /mnt/out/rc"
     )
     try:
-        subprocess.run(
+        proc = subprocess.run(
             bwrap_cmd(workdir, wrapped, outdir),
             capture_output=True,
             timeout=timeout,
@@ -202,7 +202,13 @@ def run_sandboxed(workdir, inner, timeout, outdir=None):
         with open(rc_path) as f:
             code = int(f.read().strip())
     except OSError, ValueError:
-        return 124, "<killed before reporting an exit code>"
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        msg = (
+            f"<bwrap failed ({proc.returncode}): {err}>"
+            if err
+            else "<killed before reporting an exit code>"
+        )
+        return proc.returncode or 124, msg
     text = ""
     try:
         size = os.path.getsize(stdout_path)
