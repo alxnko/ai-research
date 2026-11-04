@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, bench-v0.1]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  check:
+    name: Lint, Types & Harness Selfcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      - name: Ruff Lint & Format Check
+        run: |
+          uvx ruff check .
+          uvx ruff format --check .
+
+      - name: ty Type Check
+        run: uvx ty check
+
+      - name: Harness Self-Check
+        run: python3 bench/selfcheck.py

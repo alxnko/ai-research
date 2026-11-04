@@ -3,7 +3,9 @@
   "title": "Make deploy.sh fail-safe",
   "prompt": "deploy.sh is unreliable. Fix it.\n\nRequired behaviour:\n- Usage: ./deploy.sh --env <name> --tag <tag>\n- Unknown arguments, missing values, or a missing --env/--tag must print a\n  message to stderr and exit 2.\n- The script must exit non-zero as soon as any command fails.\n- Referencing an unset variable must be an error, not an empty string.\n- It writes the line \"deploy <env> <tag>\" to deploy.log in the current\n  directory, then prints \"deployed <env> <tag>\" to stdout.\n- It must work when the checkout path contains spaces.\n\nOnly deploy.sh should change.",
   "test_cmd": "bash _hidden/test_deploy.sh",
-  "timeout_s": 30,
+  "timeout_s": 10,
   "cmd_timeout_s": 60,
-  "allowed_files": ["deploy.sh"]
+  "allowed_files": [
+    "deploy.sh"
+  ]
 }
