@@ -299,6 +299,150 @@ def runner_smoke_test():
     return failures
 
 
+def isolation_backend_checks():
+    """Verify that isolation backend detection works and executes properly."""
+    failures = []
+    cgroup_ok = bench.check_cgroup_v2()
+    tmp = tempfile.mkdtemp(prefix="bench-iso-test-")
+    try:
+        rc, out = bench.run_sandboxed(tmp, "echo hello-isolation", timeout=10)
+        if rc != 0 or "hello-isolation" not in out:
+            failures.append(
+                ("isolation_backend", f"basic execution failed (rc={rc})", out)
+            )
+
+        rc_fb, out_fb = bench.run_sandboxed(
+            tmp, "echo fallback-isolation", timeout=10, isolation="posix_fallback"
+        )
+        if rc_fb != 0 or "fallback-isolation" not in out_fb:
+            failures.append(
+                ("isolation_backend", f"fallback execution failed (rc={rc_fb})", out_fb)
+            )
+
+        if cgroup_ok:
+            rc_cg, out_cg = bench.run_sandboxed(
+                tmp, "echo cgroup-isolation", timeout=10, isolation="cgroup_v2"
+            )
+            if rc_cg != 0 or "cgroup-isolation" not in out_cg:
+                failures.append(
+                    ("isolation_backend", f"cgroup failed (rc={rc_cg})", out_cg)
+                )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
+def resume_integration_test():
+    """Verify that interrupted runs can be resumed via --resume:
+    1. Already completed tasks are not re-executed.
+    2. Incomplete or corrupted task directories are discarded and re-executed.
+    3. Final results.json contains all tasks.
+    """
+    tmp_run = tempfile.mkdtemp(prefix="bench-resume-test-")
+    failures = []
+    try:
+        config = {
+            "model": "mock:test",
+            "ctx": 2048,
+            "ngpu": 0,
+            "steps": 5,
+            "repeat": 1,
+            "max_wall": 60,
+            "tag": "test-resume",
+            "task": "",
+        }
+        with open(os.path.join(tmp_run, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        rec1 = {
+            "task": "debugging-default-arg",
+            "repeat": 0,
+            "passed": True,
+            "steps": 2,
+            "agent_wall_s": 1.5,
+            "verification_wall_s": 0.5,
+            "total_wall_s": 2.0,
+            "peak_vram_mib": 0,
+            "invalid_actions": 0,
+            "model": "mock:test",
+        }
+        results_path = os.path.join(tmp_run, "results.json")
+        with open(results_path, "w") as f:
+            json.dump([rec1], f, indent=2)
+
+        task2_id = "debugging-off-by-one"
+        tdir2 = os.path.join(tmp_run, "r0", task2_id)
+        os.makedirs(os.path.join(tdir2, "work"), exist_ok=True)
+        corrupt_marker = os.path.join(tdir2, "work", "interrupted.corrupt")
+        with open(corrupt_marker, "w") as f:
+            f.write("partial work left behind by interruption")
+
+        def mock_chat2(model, msgs, ctx, ngpu, timeout=1800):
+            sol_path = os.path.join(ROOT, "tasks", task2_id, "solution", "chunker.py")
+            with open(sol_path) as sf:
+                sol = sf.read()
+            return f'RUN: cat > chunker.py << "EOF"\n{sol}\nEOF\n', "", 25
+
+        with open(results_path) as f:
+            existing_recs = json.load(f)
+        completed_keys = {
+            (r.get("repeat", 0), r.get("task")) for r in existing_recs if r.get("task")
+        }
+
+        if (0, "debugging-default-arg") not in completed_keys:
+            failures.append(
+                ("resume_integration", "task 1 was not recognized as completed", "")
+            )
+
+        if os.path.exists(tdir2):
+            shutil.rmtree(tdir2, ignore_errors=True)
+
+        meta2 = load_task(task2_id)
+        rec2 = bench.run_task(
+            meta=meta2,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=5,
+            max_wall=60,
+            run_dir=tdir2,
+            verbose=False,
+            chat_fn=mock_chat2,
+        )
+        rec2["task"] = task2_id
+        rec2["repeat"] = 0
+        existing_recs.append(rec2)
+
+        with open(results_path, "w") as f:
+            json.dump(existing_recs, f, indent=2)
+
+        with open(results_path) as f:
+            final_recs = json.load(f)
+        if len(final_recs) != 2:
+            failures.append(
+                (
+                    "resume_integration",
+                    f"expected 2 tasks in results, got {len(final_recs)}",
+                    "",
+                )
+            )
+        if not final_recs[0]["passed"] or not final_recs[1]["passed"]:
+            failures.append(
+                ("resume_integration", "resumed task failed", str(final_recs))
+            )
+        if os.path.exists(corrupt_marker):
+            failures.append(
+                ("resume_integration", "corrupted task state was not cleaned", "")
+            )
+    except Exception as e:
+        failures.append(
+            ("resume_integration", f"exception during resume test: {e}", "")
+        )
+    finally:
+        shutil.rmtree(tmp_run, ignore_errors=True)
+    return failures
+
+
 def check_task(tid):
     """Runs in a worker thread; every attempt gets its own temp workspace."""
     meta = load_task(tid)
@@ -328,6 +472,10 @@ def main():
     for problem in sandbox_regression_checks():
         failures.append(("sandbox_regression", problem, ""))
     for item in runner_smoke_test():
+        failures.append(item)
+    for item in isolation_backend_checks():
+        failures.append(item)
+    for item in resume_integration_test():
         failures.append(item)
 
     ids = all_tasks()

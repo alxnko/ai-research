@@ -178,11 +178,116 @@ def bwrap_cmd(workdir, cmd_args, outdir=None):
     return args
 
 
-def run_sandboxed(workdir, cmd, timeout, outdir=None):
-    """Run under bwrap. The command is written to an isolated runner script
-    to preserve heredocs, multiline syntax, quotes, and exit codes without
-    any shell concatenation. The exit code is determined authoritatively
-    by the parent harness via bwrap process status."""
+def check_cgroup_v2() -> bool:
+    """Check if unprivileged systemd user cgroup v2 limits are functional."""
+    env = {
+        "PATH": "/usr/bin:/bin:/opt/python/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    try:
+        res = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "-q",
+                "-p",
+                "MemoryMax=4G",
+                "-p",
+                "TasksMax=512",
+                "true",
+            ],
+            capture_output=True,
+            timeout=3,
+            env=env,
+        )
+        return res.returncode == 0
+    except OSError, subprocess.SubprocessError:
+        return False
+
+
+def _read_output_tail(path: str, cap: int = OUTPUT_CAP) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > cap:
+                f.seek(size - cap)
+                prefix = f"<output truncated, last {cap} bytes>\n"
+            else:
+                prefix = ""
+            return prefix + f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _write_runner_script(
+    script_path: str, stdout_path: str, cmd: str, use_cgroup: bool
+) -> None:
+    for path in (stdout_path, script_path):
+        if os.path.exists(path):
+            os.remove(path)
+    normalized_cmd = cmd.rstrip("\r\n") + "\n"
+    limits = [
+        "ulimit -t 120 2>/dev/null || true",
+        "ulimit -f 16384 2>/dev/null || true",
+    ]
+    if not use_cgroup:
+        limits.append("ulimit -u 512 2>/dev/null || true")
+    limits_str = "\n".join(limits) + "\n"
+    script_content = (
+        "#!/usr/bin/env bash\n"
+        "exec > /mnt/out/stdout 2>&1\n"
+        f"{limits_str}"
+        f"{normalized_cmd}"
+    )
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_content)
+    os.chmod(script_path, 0o755)
+
+
+def _build_sandbox_command(
+    workdir: str,
+    outdir: str,
+    use_cgroup: bool,
+) -> tuple[list[str], dict[str, str]]:
+    base_bwrap = bwrap_cmd(workdir, ["bash", "/mnt/out/run.sh"], outdir)
+    host_env = {
+        "PATH": "/usr/bin:/bin:/opt/python/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    if not use_cgroup:
+        return base_bwrap, host_env
+
+    for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if k in os.environ:
+            host_env[k] = os.environ[k]
+    cmd = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-q",
+        "-p",
+        "MemoryMax=4G",
+        "-p",
+        "TasksMax=512",
+        "--",
+        *base_bwrap,
+    ]
+    return cmd, host_env
+
+
+def run_sandboxed(workdir, cmd, timeout, outdir=None, isolation="auto"):
+    """Run under bwrap with cgroup v2 or portable POSIX limits.
+    The command is written to an isolated runner script to preserve
+    heredocs, multiline syntax, quotes, and exit codes without shell concatenation.
+    Process exit code is determined authoritatively by the host harness."""
     cleanup_outdir = False
     if not outdir:
         outdir = tempfile.mkdtemp(prefix="bench-out-")
@@ -190,34 +295,17 @@ def run_sandboxed(workdir, cmd, timeout, outdir=None):
     os.makedirs(outdir, exist_ok=True)
     stdout_path = os.path.join(outdir, "stdout")
     script_path = os.path.join(outdir, "run.sh")
-    for path in (stdout_path, script_path):
-        if os.path.exists(path):
-            os.remove(path)
 
-    normalized_cmd = cmd.rstrip("\r\n") + "\n"
-    script_content = (
-        "#!/usr/bin/env bash\n"
-        "exec > /mnt/out/stdout 2>&1\n"
-        "ulimit -t 120 2>/dev/null || true\n"
-        "ulimit -f 16384 2>/dev/null || true\n"
-        "ulimit -u 512 2>/dev/null || true\n"
-        "ulimit -v 4194304 2>/dev/null || true\n"
-        f"{normalized_cmd}"
-    )
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(script_content)
-    os.chmod(script_path, 0o755)
+    use_cgroup = isolation == "cgroup_v2" or (isolation == "auto" and check_cgroup_v2())
+    _write_runner_script(script_path, stdout_path, cmd, use_cgroup)
+    cmd_to_run, host_env = _build_sandbox_command(workdir, outdir, use_cgroup)
 
     try:
         proc = subprocess.run(
-            bwrap_cmd(workdir, ["bash", "/mnt/out/run.sh"], outdir),
+            cmd_to_run,
             capture_output=True,
             timeout=timeout,
-            env={
-                "PATH": "/usr/bin:/bin:/opt/python/bin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            },
+            env=host_env,
         )
         code = proc.returncode
     except subprocess.TimeoutExpired:
@@ -225,18 +313,7 @@ def run_sandboxed(workdir, cmd, timeout, outdir=None):
             shutil.rmtree(outdir, ignore_errors=True)
         return 124, f"<timeout after {timeout}s>"
 
-    text = ""
-    try:
-        if os.path.exists(stdout_path):
-            size = os.path.getsize(stdout_path)
-            with open(stdout_path, "rb") as f:
-                if size > OUTPUT_CAP:
-                    f.seek(size - OUTPUT_CAP)
-                    text = f"<output truncated, last {OUTPUT_CAP} bytes>\n"
-                text += f.read().decode("utf-8", "replace")
-    except OSError:
-        pass
-
+    text = _read_output_tail(stdout_path)
     if not text and code != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         if err:
@@ -388,6 +465,8 @@ def clean_copy(src, dst):
 
 def prepare(meta, run_dir):
     work = os.path.join(run_dir, "work")
+    if os.path.exists(work):
+        shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(os.path.join(meta["dir"], "repo"), work)
     with open(os.path.join(run_dir, "baseline.json"), "w") as f:
         json.dump(snapshot(work), f, indent=2)
@@ -674,6 +753,7 @@ def environment():
         "ram_gib": _sh("free -g | awk '/^Mem:/{print $2}'"),
         "ollama_env": safe_ollama_env,
         "models": _sh("ollama list | awk '{print $1, $2, $3, $4}'"),
+        "isolation_backend": "cgroup_v2" if check_cgroup_v2() else "posix_fallback",
     }
 
 
@@ -718,6 +798,60 @@ def model_digest(model):
     return fp["weights_digest"] or fp["config_digest"]
 
 
+def _resolve_run_dir_and_config(args, parser):
+    if args.resume:
+        run_dir = os.path.abspath(args.resume)
+        if not os.path.isdir(run_dir):
+            print(f"Error: resume directory does not exist: {run_dir}", file=sys.stderr)
+            sys.exit(1)
+        config_path = os.path.join(run_dir, "config.json")
+        saved = {}
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                saved = json.load(f)
+            if (
+                args.model
+                and args.model != saved.get("model")
+                and args.model != parser.get_default("model")
+            ):
+                expected = saved.get("model")
+                print(
+                    f"Error: model mismatch on resume (run has {expected}, "
+                    f"requested {args.model})",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        return run_dir, {
+            "model": saved.get("model", args.model),
+            "ctx": saved.get("ctx", args.ctx),
+            "ngpu": saved.get("ngpu", args.ngpu),
+            "steps": saved.get("steps", args.steps),
+            "repeat": saved.get("repeat", args.repeat),
+            "max_wall": saved.get("max_wall", args.max_wall),
+        }
+
+    if args.run_dir:
+        run_dir = os.path.abspath(args.run_dir)
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        tag = f"-{args.tag}" if args.tag else ""
+        run_dir = os.path.join(RUNS, f"{stamp}{tag}")
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "model": args.model,
+        "ctx": args.ctx,
+        "ngpu": args.ngpu,
+        "steps": args.steps,
+        "repeat": args.repeat,
+        "max_wall": args.max_wall,
+        "tag": args.tag or "",
+        "task": args.task or "",
+    }
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    return run_dir, cfg
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="qwen2.5-coder:7b")
@@ -733,6 +867,8 @@ def main():
         default=1200,
         help="task wall-clock budget in seconds",
     )
+    p.add_argument("--resume", help="path to existing run directory to resume")
+    p.add_argument("--run-dir", help="custom destination directory for this run")
     args = p.parse_args()
 
     ids = [args.task] if args.task else all_tasks()
@@ -740,25 +876,31 @@ def main():
         print("no tasks found", file=sys.stderr)
         return 1
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    tag = f"-{args.tag}" if args.tag else ""
-    run_dir = os.path.join(RUNS, f"{stamp}{tag}")
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir, cfg = _resolve_run_dir_and_config(args, p)
+    model = cfg["model"]
+    ctx = cfg["ctx"]
+    ngpu = cfg["ngpu"]
+    max_steps = cfg["steps"]
+    repeat = cfg["repeat"]
+    max_wall = cfg["max_wall"]
 
     env = environment()
-    fp = model_fingerprint(args.model)
+    fp = model_fingerprint(model)
     env["model_fingerprint"] = fp
     env["model_digest"] = fp["weights_digest"] or fp["config_digest"]
 
-    with open(os.path.join(run_dir, "env.json"), "w") as f:
-        json.dump(env, f, indent=2)
+    env_path = os.path.join(run_dir, "env.json")
+    if not os.path.exists(env_path):
+        with open(env_path, "w") as f:
+            json.dump(env, f, indent=2)
 
+    iso = env.get("isolation_backend", "posix_fallback")
     print(
         f"RUN {run_dir}\n"
-        f"model={args.model} ({env['model_digest']})  "
-        f"ctx={args.ctx}  ngpu={args.ngpu}  tasks={len(ids)}  repeat={args.repeat}\n"
+        f"model={model} ({env['model_digest']})  "
+        f"ctx={ctx}  ngpu={ngpu}  tasks={len(ids)}  repeat={repeat}\n"
         f"host={env['gpu']} (driver {env['nvidia_driver']})  "
-        f"python={env['python']}\n",
+        f"python={env['python']}  isolation={iso}\n",
         flush=True,
     )
 
@@ -769,24 +911,28 @@ def main():
         try:
             with open(results_path) as f:
                 recs = json.load(f)
-                completed_keys = {(r.get("repeat", 0), r.get("task")) for r in recs}
-                print(f"Resuming run: found {len(recs)} already completed task(s).")
+                completed_keys = {
+                    (r.get("repeat", 0), r.get("task")) for r in recs if r.get("task")
+                }
+                print(f"Resuming run: found {len(completed_keys)} completed task(s).")
         except Exception:
             recs = []
 
-    for rep in range(args.repeat):
+    for rep in range(repeat):
         for tid in ids:
             if (rep, tid) in completed_keys:
                 continue
             meta = load_task(tid)
             tdir = os.path.join(run_dir, f"r{rep}", tid)
+            if os.path.exists(tdir):
+                shutil.rmtree(tdir, ignore_errors=True)
             rec = run_task(
                 meta,
-                args.model,
-                args.ctx,
-                args.ngpu,
-                args.steps,
-                args.max_wall,
+                model,
+                ctx,
+                ngpu,
+                max_steps,
+                max_wall,
                 tdir,
             )
             rec["task"] = tid
