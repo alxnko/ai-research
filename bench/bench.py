@@ -10,9 +10,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
-from typing import Any
+from typing import Any, BinaryIO
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -126,7 +127,7 @@ def task_digest(task_id: str) -> str:
 def bwrap_cmd(
     workdir: str,
     inner_cmd: list[str],
-    outdir: str | None = None,
+    script_path: str | None = None,
     allow_network: bool = False,
 ) -> list[str]:
     """Assemble bubblewrap sandbox arguments."""
@@ -172,8 +173,8 @@ def bwrap_cmd(
         args.extend(["--ro-bind-try", sys.prefix, "/opt/bench-venv"])
     if not allow_network:
         args.append("--unshare-net")
-    if outdir:
-        args.extend(["--bind", outdir, "/mnt/out"])
+    if script_path:
+        args.extend(["--ro-bind", script_path, "/bench-run.sh"])
     for ef in ETC_FILES:
         if os.path.exists(ef):
             args.extend(["--ro-bind", ef, ef])
@@ -266,28 +267,36 @@ def check_cgroup_v2() -> bool:
 OUTPUT_CAP = 32768
 
 
-def _read_output_tail(path: str, cap: int = OUTPUT_CAP) -> str:
+def _read_output_tail_file(f: BinaryIO, cap: int = OUTPUT_CAP) -> str:
     try:
-        if not os.path.exists(path):
-            return ""
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            if size > cap:
-                f.seek(size - cap)
-                prefix = f"<output truncated, last {cap} bytes>\n"
-            else:
-                prefix = ""
-            return prefix + f.read().decode("utf-8", "replace")
+        f.flush()
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        if size > cap:
+            f.seek(size - cap)
+            prefix = f"<output truncated, last {cap} bytes>\n"
+        else:
+            f.seek(0)
+            prefix = ""
+        return prefix + f.read().decode("utf-8", "replace")
     except OSError:
         return ""
 
 
-def _write_runner_script(
-    script_path: str, stdout_path: str, cmd: str, use_cgroup: bool
-) -> None:
-    for path in (stdout_path, script_path):
-        if os.path.exists(path):
-            os.remove(path)
+def _read_output_tail(path: str, cap: int = OUTPUT_CAP) -> str:
+    """Read bounded tail of a file path securely without following symlinks."""
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        with open(fd, "rb") as f:
+            return _read_output_tail_file(f, cap=cap)
+    except OSError:
+        return ""
+
+
+def _write_runner_script(script_path: str, cmd: str, use_cgroup: bool) -> None:
+    if os.path.exists(script_path):
+        os.remove(script_path)
     normalized_cmd = cmd.rstrip("\r\n") + "\n"
     limits = [
         "ulimit -t 120 2>/dev/null || true",
@@ -296,12 +305,7 @@ def _write_runner_script(
     if not use_cgroup:
         limits.append("ulimit -u 512 2>/dev/null || true")
     limits_str = "\n".join(limits) + "\n"
-    script_content = (
-        "#!/usr/bin/env bash\n"
-        "exec > /mnt/out/stdout 2>&1\n"
-        f"{limits_str}"
-        f"{normalized_cmd}"
-    )
+    script_content = f"#!/usr/bin/env bash\n{limits_str}{normalized_cmd}"
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
     os.chmod(script_path, 0o755)
@@ -309,11 +313,11 @@ def _write_runner_script(
 
 def _build_sandbox_command(
     workdir: str,
-    outdir: str,
+    script_path: str,
     use_cgroup: bool,
     unit_name: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    base_bwrap = bwrap_cmd(workdir, ["bash", "/mnt/out/run.sh"], outdir)
+    base_bwrap = bwrap_cmd(workdir, ["bash", "/bench-run.sh"], script_path=script_path)
     host_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LANG": "C.UTF-8",
@@ -330,7 +334,7 @@ def _build_sandbox_command(
         "--user",
         "--scope",
         "-q",
-        *(["--unit", unit_name] if unit_name else []),
+        *([f"--unit={unit_name}"] if unit_name else []),
         "-p",
         "MemoryMax=4G",
         "-p",
@@ -380,9 +384,12 @@ def run_sandboxed(
     strict_isolation: bool = False,
 ) -> tuple[int, str]:
     """Execute command inside the bubblewrap sandbox with hard limits."""
+    cleanup_temp_out = False
     if outdir is None:
-        outdir = os.path.join(workdir, ".bench_out")
-    os.makedirs(outdir, exist_ok=True)
+        outdir = tempfile.mkdtemp(prefix="bench-cmd-out-")
+        cleanup_temp_out = True
+    else:
+        os.makedirs(outdir, exist_ok=True)
     stdout_path = os.path.join(outdir, "stdout")
     script_path = os.path.join(outdir, "run.sh")
 
@@ -394,35 +401,41 @@ def run_sandboxed(
         )
     use_cgroup = cgroup_ok
     unit_name = f"bench-cmd-{uuid.uuid4().hex[:12]}" if use_cgroup else None
-    _write_runner_script(script_path, stdout_path, cmd, use_cgroup)
+    _write_runner_script(script_path, cmd, use_cgroup)
     bwrap_full, host_env = _build_sandbox_command(
-        workdir, outdir, use_cgroup, unit_name=unit_name
+        workdir, script_path, use_cgroup, unit_name=unit_name
     )
 
+    if os.path.exists(stdout_path):
+        os.remove(stdout_path)
+    flags = os.O_CREAT | os.O_TRUNC | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    stdout_fd = os.open(stdout_path, flags, 0o600)
+
     try:
-        proc = subprocess.Popen(
-            bwrap_full,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=host_env,
-        )
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            cleanup_err = ""
-            if use_cgroup and unit_name:
-                ok, msg = _kill_cgroup_scope(unit_name)
-                if not ok:
-                    cleanup_err = f"\n[bench: cgroup cleanup failure: {msg}]"
-            proc.kill()
-            proc.wait()
-            out = _read_output_tail(stdout_path)
-            return (
-                -1,
-                f"{out}\n[bench: command timed out after {timeout}s]{cleanup_err}",
+        with open(stdout_fd, "w+b") as stdout_file:
+            proc = subprocess.Popen(
+                bwrap_full,
+                stdout=stdout_file,
+                stderr=subprocess.STDOUT,
+                env=host_env,
             )
-        out = _read_output_tail(stdout_path)
-        return proc.returncode, out
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                cleanup_err = ""
+                if use_cgroup and unit_name:
+                    ok, msg = _kill_cgroup_scope(unit_name)
+                    if not ok:
+                        cleanup_err = f"\n[bench: cgroup cleanup failure: {msg}]"
+                proc.kill()
+                proc.wait()
+                out = _read_output_tail_file(stdout_file)
+                return (
+                    -1,
+                    f"{out}\n[bench: command timed out after {timeout}s]{cleanup_err}",
+                )
+            out = _read_output_tail_file(stdout_file)
+            return proc.returncode, out
     except Exception as e:
         if strict_isolation and use_cgroup:
             raise RuntimeError(f"Strict isolation spawn failure: {e}") from e
@@ -430,6 +443,8 @@ def run_sandboxed(
     finally:
         if use_cgroup and unit_name:
             _kill_cgroup_scope(unit_name)
+        if cleanup_temp_out:
+            shutil.rmtree(outdir, ignore_errors=True)
 
 
 def assert_sandbox_python(

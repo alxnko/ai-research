@@ -1412,6 +1412,86 @@ def cgroup_background_child_termination_tests() -> list[tuple[str, str, str]]:
     return failures
 
 
+def sandbox_output_symlink_regression_test() -> list[tuple[str, str, str]]:
+    """Verify untrusted sandbox cannot disclose host files via output symlinks."""
+    failures: list[tuple[str, str, str]] = []
+    tmp = tempfile.mkdtemp(prefix="bench-sec-sentinel-")
+    try:
+        sentinel_dir = os.path.join(tmp, "host_private")
+        os.makedirs(sentinel_dir, exist_ok=True)
+        sentinel_file = os.path.join(sentinel_dir, "secret.key")
+        sentinel_secret = "HARMLESS_HOST_SENTINEL_TOKEN_SECRET_987654"
+        with open(sentinel_file, "w") as f:
+            f.write(sentinel_secret)
+
+        work = os.path.join(tmp, "work")
+        os.makedirs(work, exist_ok=True)
+        cmd_out_dir = os.path.join(tmp, "cmd_out")
+        os.makedirs(cmd_out_dir, exist_ok=True)
+
+        attack_cmd = (
+            f"mkdir -p /mnt/out 2>/dev/null || true; "
+            f"ln -sf '{sentinel_file}' /mnt/out/stdout 2>/dev/null || true; "
+            f"ln -sf '{sentinel_file}' /mnt/work/stdout 2>/dev/null || true; "
+            f"echo 'normal agent output'"
+        )
+
+        _, out = run_sandboxed(work, attack_cmd, timeout=10, outdir=cmd_out_dir)
+
+        if sentinel_secret in out:
+            failures.append(
+                (
+                    "sandbox_output_security",
+                    "host sentinel content was disclosed through sandboxed output",
+                    out,
+                )
+            )
+        if "normal agent output" not in out:
+            failures.append(
+                (
+                    "sandbox_output_security",
+                    "normal sandboxed output was not captured",
+                    out,
+                )
+            )
+
+        mount_probe_cmd = (
+            "touch /mnt/out/test_leak.txt 2>/dev/null && "
+            "echo 'OUTPUT_DIR_MOUNTED' || echo 'OUTPUT_DIR_UNMOUNTED'"
+        )
+        _, out_probe = run_sandboxed(
+            work, mount_probe_cmd, timeout=10, outdir=cmd_out_dir
+        )
+        if "OUTPUT_DIR_MOUNTED" in out_probe or os.path.exists(
+            os.path.join(cmd_out_dir, "test_leak.txt")
+        ):
+            failures.append(
+                (
+                    "sandbox_output_security",
+                    "sandbox was able to write directly into host output directory",
+                    out_probe,
+                )
+            )
+
+        overwrite_cmd = (
+            "echo 'echo PWNED' > /bench-run.sh 2>/dev/null && "
+            "echo 'WRITABLE' || echo 'READONLY'"
+        )
+        _, out_ro = run_sandboxed(work, overwrite_cmd, timeout=10, outdir=cmd_out_dir)
+        if "WRITABLE" in out_ro:
+            failures.append(
+                (
+                    "sandbox_output_security",
+                    "/bench-run.sh was writable from inside the sandbox",
+                    out_ro,
+                )
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return failures
+
+
 def attempt(
     meta: dict[str, Any], solution: bool
 ) -> tuple[int, str, dict[str, list[str]]]:
@@ -1501,6 +1581,9 @@ def main() -> int:
 
     print("Running cgroup background child termination tests...")
     failures.extend(cgroup_background_child_termination_tests())
+
+    print("Running sandbox output symlink security tests...")
+    failures.extend(sandbox_output_symlink_regression_test())
 
     ids = all_tasks()
     print(f"Running golden solution checks for {len(ids)} tasks in parallel...")
