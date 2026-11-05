@@ -11,6 +11,16 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any
 
+try:
+    import importlib
+
+    pynvml: Any = importlib.import_module("pynvml")
+    pynvml.nvmlInit()
+    HAS_PYNVML = True
+except Exception:
+    HAS_PYNVML = False
+    pynvml = None
+
 SAMPLING_VERSION = "v1"
 
 BENCH_TOOLS = [
@@ -116,9 +126,10 @@ def parse_stream_chunk_event(
         state["done"] = True
         state["done_reason"] = chunk.get("done_reason", "stop")
         state["prompt_eval_count"] = int(chunk.get("prompt_eval_count", 0))
-        state["prompt_eval_cached_count"] = int(
-            chunk.get("prompt_eval_cached_count", 0)
-        )
+        if "prompt_eval_cached_count" in chunk:
+            state["prompt_eval_cached_count"] = int(chunk["prompt_eval_cached_count"])
+        else:
+            state["prompt_eval_cached_count"] = None
         state["prompt_eval_duration_ns"] = int(chunk.get("prompt_eval_duration", 0))
         state["eval_count"] = int(chunk.get("eval_count", 0))
         state["eval_duration_ns"] = int(chunk.get("eval_duration", 0))
@@ -137,6 +148,9 @@ def build_telemetry_record(
     prompt_dur_s = state.get("prompt_eval_duration_ns", 0) / 1e9
     eval_count = state.get("eval_count", 0)
     prompt_count = state.get("prompt_eval_count", 0)
+    done = state.get("done", False)
+    default_reason = "stream_truncated_without_done" if not done else "unknown"
+    done_reason = state.get("done_reason", default_reason)
 
     decode_tps = round(eval_count / eval_dur_s, 2) if eval_dur_s > 0 else 0.0
     prompt_tps = round(prompt_count / prompt_dur_s, 2) if prompt_dur_s > 0 else 0.0
@@ -158,7 +172,8 @@ def build_telemetry_record(
         "total_duration_s": round(state.get("total_duration_ns", 0) / 1e9, 4),
         "load_duration_s": round(state.get("load_duration_ns", 0) / 1e9, 4),
         "transport_wall_s": round(wall_duration_s, 4),
-        "done_reason": state.get("done_reason", "unknown"),
+        "incomplete_stream": not done,
+        "done_reason": done_reason,
         "content_length_chars": len(state.get("content", "")),
         "thinking_length_chars": len(state.get("thinking", "")),
         "tool_call_count": len(state.get("tool_calls", [])),
@@ -310,7 +325,9 @@ def summarize_inference(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def check_gpu_telemetry() -> str:
-    """Detect whether GPU telemetry via nvidia-smi is available."""
+    """Detect whether GPU telemetry via pynvml or nvidia-smi is available."""
+    if HAS_PYNVML:
+        return "available"
     try:
         res = subprocess.run(
             [
@@ -328,20 +345,45 @@ def check_gpu_telemetry() -> str:
         return "unavailable"
 
 
-def get_gpu_memory() -> dict[str, Any]:
-    """Query total device VRAM, used device VRAM, and Ollama-specific VRAM."""
-    status = check_gpu_telemetry()
-    if status != "available":
+def _query_pynvml_memory() -> dict[str, Any] | None:
+    """Attempt fast in-process query via NVML."""
+    if not HAS_PYNVML or pynvml is None:
+        return None
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        total_mib = int(mem_info.total // (1024 * 1024))
+        used_mib = int(mem_info.used // (1024 * 1024))
+        procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        total_ollama = 0
+        for p in procs:
+            try:
+                name = (
+                    pynvml.nvmlSystemGetProcessName(p.pid)
+                    .decode("utf-8", "replace")
+                    .lower()
+                )
+            except Exception:
+                name = ""
+            if "ollama" in name or "llama-server" in name:
+                total_ollama += int(p.usedGpuMemory // (1024 * 1024))
+        ollama_mib = total_ollama if total_ollama > 0 else None
         return {
-            "device_vram_total_mib": None,
-            "device_vram_used_mib": None,
-            "ollama_vram_used_mib": None,
-            "telemetry_status": status,
+            "device_vram_total_mib": total_mib,
+            "device_vram_used_mib": used_mib,
+            "ollama_vram_used_mib": ollama_mib,
+            "telemetry_status": "available",
+            "telemetry_source": "pynvml",
         }
+    except Exception:
+        return None
 
+
+def _query_nvidia_smi_memory() -> tuple[int | None, int | None, int | None]:
+    """Fallback query via nvidia-smi CLI."""
     total_mib: int | None = None
     used_mib: int | None = None
-    ollama_mib: int = 0
+    ollama_mib: int | None = None
 
     try:
         res = subprocess.run(
@@ -354,8 +396,7 @@ def get_gpu_memory() -> dict[str, Any]:
             timeout=3,
         )
         if res.returncode == 0:
-            line = res.stdout.decode().strip()
-            parts = [p.strip() for p in line.split(",") if p.strip()]
+            parts = [p.strip() for p in res.stdout.decode().split(",") if p.strip()]
             if len(parts) >= 2:
                 total_mib = int(parts[0])
                 used_mib = int(parts[1])
@@ -373,31 +414,55 @@ def get_gpu_memory() -> dict[str, Any]:
             timeout=3,
         )
         if apps_res.returncode == 0:
+            total_ollama = 0
             for raw_line in apps_res.stdout.decode().splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = [p.strip() for p in line.split(",") if p.strip()]
+                parts = [p.strip() for p in raw_line.strip().split(",") if p.strip()]
                 if len(parts) >= 3:
                     pname = parts[1].lower()
-                    mem = int(parts[2])
                     if "ollama" in pname or "llama-server" in pname:
-                        ollama_mib += mem
+                        total_ollama += int(parts[2])
+            if total_ollama > 0:
+                ollama_mib = total_ollama
     except Exception:
         pass
 
+    return total_mib, used_mib, ollama_mib
+
+
+def get_gpu_memory() -> dict[str, Any]:
+    """Query total device VRAM, used device VRAM, and Ollama-specific VRAM."""
+    status = check_gpu_telemetry()
+    if status != "available":
+        return {
+            "device_vram_total_mib": None,
+            "device_vram_used_mib": None,
+            "ollama_vram_used_mib": None,
+            "telemetry_status": status,
+            "telemetry_source": "none",
+        }
+
+    pynvml_res = _query_pynvml_memory()
+    if pynvml_res is not None:
+        return pynvml_res
+
+    tot, used, ollama = _query_nvidia_smi_memory()
     return {
-        "device_vram_total_mib": total_mib,
-        "device_vram_used_mib": used_mib,
-        "ollama_vram_used_mib": ollama_mib if ollama_mib > 0 else None,
+        "device_vram_total_mib": tot,
+        "device_vram_used_mib": used,
+        "ollama_vram_used_mib": ollama,
         "telemetry_status": "available",
+        "telemetry_source": "nvidia-smi",
     }
 
 
 def get_ollama_offload_status(
     model_name: str, url: str = "http://127.0.0.1:11434/api/ps"
 ) -> dict[str, Any]:
-    """Query Ollama /api/ps to determine model offloading ratio to GPU."""
+    """Query Ollama /api/ps to inspect model memory residency and runner details.
+
+    Note: reported_vram_size_ratio compares size_vram against model size; it is a
+    memory byte fraction reported by the runner, not a count of resident layers.
+    """
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -419,13 +484,23 @@ def get_ollama_offload_status(
                     "loaded": True,
                     "size_bytes": size,
                     "size_vram_bytes": size_vram,
-                    "offload_ratio": ratio,
+                    "reported_vram_size_ratio": ratio,
                     "runner": m.get("runner", "unknown"),
                     "context_length": m.get("context_length"),
+                    "details": m.get("details", {}),
                 }
-        return {"loaded": False, "offload_ratio": 0.0}
+        return {
+            "loaded": False,
+            "reported_vram_size_ratio": None,
+            "details": None,
+        }
     except Exception:
-        return {"loaded": False, "offload_ratio": 0.0, "error": "unreachable"}
+        return {
+            "loaded": False,
+            "reported_vram_size_ratio": None,
+            "details": None,
+            "error": "unreachable",
+        }
 
 
 class VramMonitor:
@@ -434,37 +509,41 @@ class VramMonitor:
     def __init__(self, interval_s: float = 0.5):
         self.interval_s = interval_s
         self.stop_event = threading.Event()
-        self.peak_device_vram = 0
-        self.peak_ollama_vram = 0
+        self.peak_device_vram: int | None = None
+        self.peak_ollama_vram: int | None = None
         self.telemetry_status = check_gpu_telemetry()
+        self.telemetry_source = (
+            "pynvml"
+            if HAS_PYNVML
+            else ("nvidia-smi" if self.telemetry_status == "available" else "none")
+        )
         self._thread: threading.Thread | None = None
 
     def _sample(self) -> None:
         while not self.stop_event.is_set():
             metrics = get_gpu_memory()
             dev_used = metrics.get("device_vram_used_mib")
-            if dev_used and dev_used > self.peak_device_vram:
-                self.peak_device_vram = dev_used
+            if dev_used is not None:
+                self.peak_device_vram = max(self.peak_device_vram or 0, dev_used)
             ollama_used = metrics.get("ollama_vram_used_mib")
-            if ollama_used and ollama_used > self.peak_ollama_vram:
-                self.peak_ollama_vram = ollama_used
+            if ollama_used is not None:
+                self.peak_ollama_vram = max(self.peak_ollama_vram or 0, ollama_used)
             time.sleep(self.interval_s)
 
     def start(self) -> None:
-        if self.telemetry_status == "available":
-            self._thread = threading.Thread(target=self._sample, daemon=True)
-            self._thread.start()
+        if self.telemetry_status != "available":
+            return
+        self.stop_event.clear()
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
 
     def stop(self) -> dict[str, Any]:
-        self.stop_event.set()
-        if self._thread:
+        if self._thread is not None and self._thread.is_alive():
+            self.stop_event.set()
             self._thread.join(timeout=2.0)
         return {
-            "peak_device_vram_mib": (
-                self.peak_device_vram if self.peak_device_vram > 0 else None
-            ),
-            "peak_ollama_vram_mib": (
-                self.peak_ollama_vram if self.peak_ollama_vram > 0 else None
-            ),
-            "gpu_telemetry_status": self.telemetry_status,
+            "peak_device_vram_mib": self.peak_device_vram,
+            "peak_ollama_vram_mib": self.peak_ollama_vram,
+            "telemetry_status": self.telemetry_status,
+            "telemetry_source": self.telemetry_source,
         }

@@ -95,34 +95,53 @@ def classify_task_run(
             outcome = "hidden_test_failure"
             evidence.append(f"verification exited with failure ({exit_status})")
 
-    # 2. Determine Possible Cause based on Empirical Evidence
-    cause = "unknown"
+    # 2. Extract Diagnostic Symptoms (observable empirical flags)
     recs = telemetry_records or []
     max_prompt_eval = max((r.get("prompt_eval_count", 0) for r in recs), default=0)
-    if max_prompt_eval >= num_ctx > 0:
-        cause = "context_loss"
+    output_limit_hit = any(r.get("done_reason") == "length" for r in recs)
+    context_full = max_prompt_eval >= num_ctx > 0
+    context_near = max_prompt_eval >= (num_ctx * 0.9) > 0
+    incomplete_stream = any(r.get("incomplete_stream", False) for r in recs)
+
+    symptoms = {
+        "output_limit_reached": output_limit_hit,
+        "context_capacity_reached": context_full,
+        "context_near_capacity": context_near,
+        "invalid_actions_detected": invalid_actions > 0,
+        "repeated_command_loop": outcome == "repeated_command",
+        "no_files_modified": not changed_files,
+        "forbidden_files_modified": bool(forbidden_files),
+        "memory_limit_exceeded": outcome == "memory_failure",
+        "timeout_exceeded": timed_out,
+        "incomplete_stream": incomplete_stream,
+        "max_prompt_eval_tokens": max_prompt_eval,
+    }
+
+    if output_limit_hit:
+        evidence.append("generation truncated due to context/length limit")
+    if context_full:
         evidence.append(
             f"prompt tokens ({max_prompt_eval}) reached or exceeded num_ctx ({num_ctx})"
         )
-    elif any(r.get("done_reason") == "length" for r in recs):
-        cause = "context_loss"
-        evidence.append("generation truncated due to context/length limit")
+    if incomplete_stream:
+        evidence.append("streaming connection closed prematurely before done event")
+
+    # 3. Determine Possible Cause
+    # Strictly default to 'unknown' unless conclusive proof establishes the cause.
+    # Physical resource exhaustion or repeated invalid tool syntax are conclusive;
+    # code failure, test failure, or context pressure do NOT establish cause
+    # without controlled ablation.
+    cause = "unknown"
+    if outcome == "memory_failure":
+        cause = "resource_constraint"
+        evidence.append("cgroup/memory ceiling breached during execution")
     elif outcome == "invalid_action":
         cause = "tool_format_incompatibility"
         evidence.append("agent failed to adhere to structured interaction format")
-    elif outcome == "memory_failure":
-        cause = "resource_constraint"
-        evidence.append("cgroup/memory ceiling breached during execution")
-    elif outcome in {"hidden_test_failure", "repeated_command", "premature_completion"}:
-        if recs and all(r.get("prompt_eval_count", 0) < num_ctx * 0.85 for r in recs):
-            cause = "insufficient_reasoning"
-            evidence.append(
-                f"solution attempted within context ({max_prompt_eval}/{num_ctx}), "
-                "but logic failed verification"
-            )
 
     return {
         "outcome": outcome,
         "possible_cause": cause,
         "evidence": evidence,
+        "symptoms": symptoms,
     }

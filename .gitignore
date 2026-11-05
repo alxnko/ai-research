@@ -1,5 +1,7 @@
 # benchmark output: transcripts, logs, per-run provenance
+runs/
 bench/runs/
+**/runs/
 
 # python
 __pycache__/

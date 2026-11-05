@@ -20,6 +20,7 @@ if REPO_ROOT not in sys.path:
 from bench.bench import (
     _mock_chat_stream,
     all_tasks,
+    assert_sandbox_python,
     check_cgroup_v2,
     clean_copy,
     install_tests,
@@ -34,6 +35,7 @@ from bench.bench import (
 )
 from bench.classifier import classify_task_run
 from bench.telemetry import (
+    StreamResult,
     build_telemetry_record,
     parse_stream_chunk_event,
 )
@@ -260,7 +262,7 @@ def classifier_unit_tests() -> list[tuple[str, str, str]]:
             ("classifier", "invalid action classification failed", str(c_invalid))
         )
 
-    # 6. Context exhaustion -> context_loss
+    # 6. Context exhaustion -> symptom context_capacity_reached=True, cause unknown
     c_ctx = classify_task_run(
         passed=False,
         timed_out=False,
@@ -274,14 +276,17 @@ def classifier_unit_tests() -> list[tuple[str, str, str]]:
         num_ctx=4096,
         telemetry_records=[{"prompt_eval_count": 4096}],
     )
-    if c_ctx["possible_cause"] != "context_loss":
+    if not c_ctx["symptoms"].get("context_capacity_reached"):
         failures.append(
-            ("classifier", "context_loss classification failed", str(c_ctx))
+            ("classifier", "context_capacity_reached symptom missing", str(c_ctx))
+        )
+    if c_ctx["possible_cause"] != "unknown":
+        failures.append(
+            ("classifier", "context exhaustion should not guess cause", str(c_ctx))
         )
 
-    # 7. Insufficient reasoning: within context budget (< 85% num_ctx)
-    # but verification failed
-    c_reason = classify_task_run(
+    # 7. Length limit hit -> symptom output_limit_reached=True, cause unknown
+    c_len = classify_task_run(
         passed=False,
         timed_out=False,
         step_count=10,
@@ -292,15 +297,15 @@ def classifier_unit_tests() -> list[tuple[str, str, str]]:
         exit_status="FAIL",
         steps=[],
         num_ctx=32768,
-        telemetry_records=[{"prompt_eval_count": 1200}],
+        telemetry_records=[{"prompt_eval_count": 1200, "done_reason": "length"}],
     )
-    if c_reason["possible_cause"] != "insufficient_reasoning":
+    if not c_len["symptoms"].get("output_limit_reached"):
         failures.append(
-            (
-                "classifier",
-                "insufficient_reasoning classification failed",
-                str(c_reason),
-            )
+            ("classifier", "output_limit_reached symptom missing", str(c_len))
+        )
+    if c_len["possible_cause"] != "unknown":
+        failures.append(
+            ("classifier", "output limit should not guess cause", str(c_len))
         )
 
     # 8. Unsubstantiated causes must remain unknown
@@ -559,6 +564,174 @@ def runner_actuator_smoke_tests() -> list[tuple[str, str, str]]:
     return failures
 
 
+def gitignore_unit_tests() -> list[tuple[str, str, str]]:
+    """Ensure benchmark runs and artifacts are strictly ignored by git."""
+    failures = []
+    test_paths = [
+        "runs/test-run/transcript.json",
+        "bench/runs/test-run/results.json",
+        "nested/sub/runs/run-1/env.json",
+    ]
+    for path in test_paths:
+        res = subprocess.run(
+            ["git", "-C", REPO_ROOT, "check-ignore", path],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            failures.append(("gitignore", f"path {path} is not gitignored", res.stderr))
+    return failures
+
+
+def sandbox_python_assertion_tests() -> list[tuple[str, str, str]]:
+    """Ensure sandbox Python interpreter is executable and matches required version."""
+    failures = []
+    tmp = tempfile.mkdtemp(prefix="bench-pyassert-")
+    try:
+        ver = assert_sandbox_python(tmp)
+        host_ver = sys.version.split()[0]
+        sb_major_minor = ".".join(ver.split(".")[:2])
+        host_major_minor = ".".join(host_ver.split(".")[:2])
+        if sb_major_minor != host_major_minor:
+            failures.append(
+                (
+                    "sandbox_python",
+                    f"version mismatch: sandbox={ver} host={host_ver}",
+                    "",
+                )
+            )
+    except Exception as e:
+        failures.append(("sandbox_python", f"assertion raised error: {e}", ""))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
+def native_tool_fairness_unit_tests() -> list[tuple[str, str, str]]:
+    """Test strict native tools actuator: multi-call, schema validation, no fallback."""
+    failures = []
+    tmp = tempfile.mkdtemp(prefix="bench-tool-fairness-")
+    meta = load_task("debugging-default-arg")
+    try:
+        call_history: list[list[dict[str, Any]]] = []
+
+        def mock_multi_call(*args: Any, **kwargs: Any) -> StreamResult:
+            msgs = args[1]
+            call_history.append(list(msgs))
+            if len(msgs) <= 2:
+                return StreamResult(
+                    content="",
+                    thinking="planning commands...",
+                    tool_calls=[
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "execute_command",
+                                "arguments": {"command": "echo 'first'"},
+                            },
+                        },
+                        {
+                            "id": "c2",
+                            "function": {
+                                "name": "execute_command",
+                                "arguments": {"command": "echo 'second'"},
+                            },
+                        },
+                    ],
+                    telemetry={"eval_count": 10, "prompt_eval_count": 20},
+                )
+            return StreamResult(
+                content="",
+                thinking="",
+                tool_calls=[
+                    {"id": "c3", "function": {"name": "finish_task", "arguments": {}}}
+                ],
+                telemetry={"eval_count": 5, "prompt_eval_count": 10},
+            )
+
+        run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=5,
+            max_wall=60,
+            run_dir=os.path.join(tmp, "multi_call"),
+            actuator="native_tools",
+            verbose=False,
+            chat_fn=mock_multi_call,
+        )
+
+        if len(call_history) < 2:
+            failures.append(
+                ("tool_fairness", "expected at least 2 chat turns for multi-call", "")
+            )
+        else:
+            turn2_msgs = call_history[1]
+            tool_results = [m for m in turn2_msgs if m.get("role") == "tool"]
+            if len(tool_results) != 2:
+                failures.append(
+                    (
+                        "tool_fairness",
+                        f"expected 2 tool results in turn 2, got {len(tool_results)}",
+                        str(tool_results),
+                    )
+                )
+            tool_names = [m.get("tool_name") for m in tool_results]
+            if tool_names != ["execute_command", "execute_command"]:
+                failures.append(
+                    ("tool_fairness", f"tool_names mismatch: {tool_names}", "")
+                )
+            tool_ids = [m.get("tool_call_id") for m in tool_results]
+            if tool_ids != ["c1", "c2"]:
+                failures.append(
+                    ("tool_fairness", f"tool_call_ids mismatch: {tool_ids}", "")
+                )
+
+        def mock_text_in_tools(*args: Any, **kwargs: Any) -> StreamResult:
+            return StreamResult(
+                content="RUN: touch should_not_exist.txt",
+                thinking="",
+                tool_calls=[],
+                telemetry={"eval_count": 10, "prompt_eval_count": 10},
+            )
+
+        rec_reject = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=2,
+            max_wall=60,
+            run_dir=os.path.join(tmp, "reject_text"),
+            actuator="native_tools",
+            verbose=False,
+            chat_fn=mock_text_in_tools,
+        )
+        if rec_reject["invalid_actions"] == 0:
+            failures.append(
+                (
+                    "tool_fairness",
+                    "plain text in native_tools was not flagged as invalid",
+                    str(rec_reject),
+                )
+            )
+        if os.path.exists(
+            os.path.join(tmp, "reject_text", "work", "should_not_exist.txt")
+        ):
+            failures.append(
+                (
+                    "tool_fairness",
+                    "plain text RUN: command was executed in native_tools mode!",
+                    "",
+                )
+            )
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
 def _check_heredocs_and_quotes(work: str) -> list[str]:
     """Test heredocs, multiline execution, quotes, and trap handling."""
     errs = []
@@ -720,6 +893,15 @@ def main() -> int:
 
     print("Running actuator smoke tests (text and native_tools)...")
     failures.extend(runner_actuator_smoke_tests())
+
+    print("Running gitignore unit tests...")
+    failures.extend(gitignore_unit_tests())
+
+    print("Running sandbox python assertion tests...")
+    failures.extend(sandbox_python_assertion_tests())
+
+    print("Running native tool fairness tests...")
+    failures.extend(native_tool_fairness_unit_tests())
 
     print("Running sandbox regression checks...")
     failures.extend(sandbox_regression_checks())
