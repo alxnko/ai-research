@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import subprocess
 import threading
 import time
@@ -150,7 +151,7 @@ def build_telemetry_record(
     prompt_count = state.get("prompt_eval_count", 0)
     done = state.get("done", False)
     if not done:
-        done_reason = "stream_truncated_without_done"
+        done_reason = state.get("done_reason") or "stream_truncated_without_done"
     else:
         done_reason = state.get("done_reason") or "stop"
 
@@ -182,6 +183,38 @@ def build_telemetry_record(
     }
 
 
+def _inference_worker(
+    pipe_conn: Any,
+    req_url: str,
+    req_body: dict[str, Any],
+    timeout_s: float,
+) -> None:
+    """Worker process that executes HTTP request and streams chunks across pipe."""
+    try:
+        req = urllib.request.Request(
+            req_url,
+            data=json.dumps(req_body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            for line in resp:
+                line_str = line.decode("utf-8", "replace").strip()
+                if not line_str:
+                    continue
+                pipe_conn.send(("chunk", line_str))
+        pipe_conn.send(("done", None))
+    except Exception as e:
+        try:
+            pipe_conn.send(("error", str(e)))
+        except (BrokenPipeError, EOFError):
+            pass
+    finally:
+        try:
+            pipe_conn.close()
+        except Exception:
+            pass
+
+
 def chat_stream(
     model: str,
     msgs: list[dict[str, Any]],
@@ -189,12 +222,12 @@ def chat_stream(
     ngpu: int,
     sampling: SamplingConfig | None = None,
     tools: list[dict[str, Any]] | None = None,
-    timeout: int = 1800,
+    timeout: float = 1800.0,
     url: str = "http://127.0.0.1:11434/api/chat",
     step: int = 0,
     request_idx: int = 1,
 ) -> StreamResult:
-    """Stream from Ollama /api/chat with per-request TTFT and token accounting."""
+    """Stream from Ollama /api/chat with per-request TTFT, token accounting, and hard deadline cancellation."""
     if sampling is None:
         sampling = SamplingConfig()
 
@@ -217,12 +250,6 @@ def chat_stream(
     if tools:
         body["tools"] = tools
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-
     state: dict[str, Any] = {
         "content": "",
         "thinking": "",
@@ -243,21 +270,85 @@ def chat_stream(
     }
 
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for line in resp:
-            line_str = line.decode("utf-8", "replace").strip()
-            if not line_str:
-                continue
-            chunk = json.loads(line_str)
-            parse_stream_chunk_event(chunk, t0, state)
+    deadline = time.monotonic() + max(0.001, float(timeout))
+
+    ctx_mp = mp.get_context("fork")
+    parent_conn, child_conn = ctx_mp.Pipe(duplex=False)
+
+    proc = ctx_mp.Process(
+        target=_inference_worker,
+        args=(child_conn, url, body, float(timeout)),
+    )
+    proc.start()
+    child_conn.close()
+
+    timed_out_deadline = False
+    worker_error: str | None = None
+
+    try:
+        while True:
+            now = time.monotonic()
+            rem = deadline - now
+            if rem <= 0:
+                timed_out_deadline = True
+                break
+
+            wait_s = min(rem, 0.05)
+            if parent_conn.poll(wait_s):
+                try:
+                    event_type, payload = parent_conn.recv()
+                except (EOFError, BrokenPipeError):
+                    break
+
+                if event_type == "chunk":
+                    chunk = json.loads(payload)
+                    parse_stream_chunk_event(chunk, t0, state)
+                elif event_type == "done":
+                    break
+                elif event_type == "error":
+                    worker_error = payload
+                    break
+            else:
+                if not proc.is_alive():
+                    if parent_conn.poll(0):
+                        try:
+                            event_type, payload = parent_conn.recv()
+                            if event_type == "chunk":
+                                chunk = json.loads(payload)
+                                parse_stream_chunk_event(chunk, t0, state)
+                            elif event_type == "error":
+                                worker_error = payload
+                        except (EOFError, BrokenPipeError):
+                            pass
+                    break
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=0.5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=0.5)
+        else:
+            proc.join(timeout=0.1)
+        parent_conn.close()
 
     t_end = time.perf_counter()
+
+    if timed_out_deadline:
+        state["done"] = False
+        state["done_reason"] = "deadline_exceeded"
+
     telemetry = build_telemetry_record(
         state,
         wall_duration_s=t_end - t0,
         step=step,
         request_idx=request_idx,
     )
+    if timed_out_deadline:
+        telemetry["timed_out"] = True
+
+    if worker_error and not state.get("done") and not timed_out_deadline:
+        raise RuntimeError(f"Inference worker failed: {worker_error}")
 
     return StreamResult(
         content=state["content"],

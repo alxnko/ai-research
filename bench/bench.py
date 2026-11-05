@@ -781,7 +781,16 @@ def run_task(
     chat_fn: Any = None,
     strict_isolation: bool = False,
 ) -> dict[str, Any]:
-    """Execute benchmark task trajectory with full telemetry and sandbox isolation."""
+    """Execute benchmark task trajectory with full telemetry and sandbox isolation.
+
+    Time Budgeting Architecture:
+    - `max_wall` (seconds) strictly bounds AGENT EXECUTION alone (`agent_wall_s`).
+      The agent loop terminates immediately if elapsed agent time exceeds max_wall.
+      Any in-flight inference requests are hard-cancelled at the monotonic deadline.
+    - Final scoring (hidden-test verification) runs post-agent in an isolated workspace
+      and is governed separately by the task's `test_timeout_s` / `timeout_s` (default: 120s).
+    - `total_wall_s` captures end-to-end wall time: `agent_wall_s + verification_wall_s`.
+    """
     os.makedirs(run_dir, exist_ok=True)
     work = prepare(meta, run_dir)
     digest = task_digest(meta["id"])
@@ -846,7 +855,7 @@ def run_task(
                     ngpu,
                     sampling=sampling,
                     tools=tools_arg,
-                    timeout=min(1800, max(1, int(rem))),
+                    timeout=min(1800.0, max(0.001, rem)),
                     step=model_turns,
                     request_idx=request_count,
                 )
@@ -867,21 +876,36 @@ def run_task(
 
             # Incomplete streams are rejected immediately and cannot trigger execution
             if res.telemetry.get("incomplete_stream"):
-                inference_error = (
-                    "Inference stream closed prematurely without done event"
-                )
-                step_entry = {
-                    "step": steps,
-                    "model_turns": model_turns,
-                    "commands_executed": commands_executed,
-                    "reply": reply,
-                    "thinking": thinking,
-                    "action": "incomplete_stream_rejected",
-                    "telemetry": res.telemetry,
-                }
-                step_records.append(step_entry)
-                transcript.append(step_entry)
-                break
+                if res.telemetry.get("done_reason") == "deadline_exceeded":
+                    timed_out = True
+                    step_entry = {
+                        "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
+                        "reply": reply,
+                        "thinking": thinking,
+                        "action": "deadline_timeout",
+                        "telemetry": res.telemetry,
+                    }
+                    step_records.append(step_entry)
+                    transcript.append(step_entry)
+                    break
+                else:
+                    inference_error = (
+                        "Inference stream closed prematurely without done event"
+                    )
+                    step_entry = {
+                        "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
+                        "reply": reply,
+                        "thinking": thinking,
+                        "action": "incomplete_stream_rejected",
+                        "telemetry": res.telemetry,
+                    }
+                    step_records.append(step_entry)
+                    transcript.append(step_entry)
+                    break
 
             # --- Actuator: Native Tools ---
             if actuator == "native_tools":
@@ -1141,7 +1165,10 @@ def run_task(
             kind, cmd = parse_action(reply)
             active_telemetry = res.telemetry
             if kind is None and thinking and not reply.strip():
-                rem_retry = max(1, int(max_wall - (time.time() - t0)))
+                rem_retry = max_wall - (time.time() - t0)
+                if rem_retry <= 0:
+                    timed_out = True
+                    break
                 retry_msgs = [
                     *msgs,
                     {"role": "assistant", "content": thinking},
@@ -1160,7 +1187,7 @@ def run_task(
                         ctx,
                         ngpu,
                         sampling=sampling,
-                        timeout=min(1800, rem_retry),
+                        timeout=min(1800.0, max(0.001, rem_retry)),
                         step=steps,
                         request_idx=request_count,
                     )
@@ -1175,20 +1202,36 @@ def run_task(
 
                 # Centralized response-integrity check applies to retry streams
                 if res_retry.telemetry.get("incomplete_stream"):
-                    inference_error = (
-                        "Inference stream closed prematurely without done event (retry)"
-                    )
-                    step_entry = {
-                        "step": steps,
-                        "model_turns": model_turns,
-                        "commands_executed": commands_executed,
-                        "reply": res_retry.content,
-                        "thinking": thinking,
-                        "action": "incomplete_stream_rejected",
-                        "telemetry": res_retry.telemetry,
-                    }
-                    step_records.append(step_entry)
-                    transcript.append(step_entry)
+                    if res_retry.telemetry.get("done_reason") == "deadline_exceeded":
+                        timed_out = True
+                        step_entry = {
+                            "step": steps,
+                            "model_turns": model_turns,
+                            "commands_executed": commands_executed,
+                            "reply": res_retry.content,
+                            "thinking": thinking,
+                            "action": "deadline_timeout",
+                            "telemetry": res_retry.telemetry,
+                        }
+                        step_records.append(step_entry)
+                        transcript.append(step_entry)
+                        break
+                    else:
+                        inference_error = (
+                            "Inference stream closed prematurely without done event (retry)"
+                        )
+                        step_entry = {
+                            "step": steps,
+                            "model_turns": model_turns,
+                            "commands_executed": commands_executed,
+                            "reply": res_retry.content,
+                            "thinking": thinking,
+                            "action": "incomplete_stream_rejected",
+                            "telemetry": res_retry.telemetry,
+                        }
+                        step_records.append(step_entry)
+                        transcript.append(step_entry)
+                        break
                     break
 
                 reply = res_retry.content
