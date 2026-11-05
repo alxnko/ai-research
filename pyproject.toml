@@ -1,0 +1,39 @@
+[project]
+name = "ai-research-bench"
+version = "0.1.0"
+description = "Agentic coding benchmark for local models on an 8 GB GPU"
+requires-python = ">=3.15"
+license = "Apache-2.0"
+
+[tool.ruff]
+line-length = 88
+target-version = "py315"
+
+# Task fixtures are deliberately buggy, minimal, or dependency-free; linting
+# them measures the fixture, not the harness.
+extend-exclude = ["bench/tasks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PL"]
+ignore = [
+  # The harness talks to external tools (ollama, nvidia-smi, git) whose
+  # failures are data, not exceptions to propagate.
+  "BLE001",
+  "S110",
+  # Sandboxed commands report their exit status for scoring; raising would
+  # discard the transcript the benchmark exists to record.
+  "PLW1510",
+  "PLR2004",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# sys.path setup must run before the local imports.
+"bench/selfcheck.py" = ["E402"]
+# The agent loop and the model call take the run configuration explicitly:
+# bundling it into a config object would hide, not reduce, what they depend on.
+"bench/bench.py" = ["PLR0913", "PLR0917", "PLR0915"]
+
+[tool.ty.environment]
+extra-paths = ["bench"]
+[tool.ty.src]
+exclude = ["bench/tasks/**"]

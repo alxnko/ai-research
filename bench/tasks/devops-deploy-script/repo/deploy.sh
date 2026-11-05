@@ -6,10 +6,11 @@ tag = ""
 
 while [ $# -gt 0 ]; do
   case $1 in
-    --env) env=$2; shift 2;;
-    --tag) tag=$2; shift 2;;
+    --env) env=$2; shift;;
+    --tag) tag=$2; shift;;
     *) echo "unknown option $1"; exit 0;;
   esac
+  shift
 done
 
 echo "deploy $env $tag" > deploy.log
