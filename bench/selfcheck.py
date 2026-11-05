@@ -17,6 +17,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from bench import bench as bench_mod
 from bench.bench import (
     _mock_chat_stream,
     all_tasks,
@@ -298,11 +299,167 @@ def premature_stream_closure_unit_tests() -> list[tuple[str, str, str]]:
     return failures
 
 
+def retry_stream_and_scoring_integrity_tests() -> list[tuple[str, str, str]]:
+    """Test retry stream rejection and verification_passed vs run_successful scoring."""
+    failures = []
+    tmp = tempfile.mkdtemp(prefix="bench-retry-stream-")
+    meta = load_task("debugging-default-arg")
+    try:
+        # 1. Retry stream ends prematurely -> no command executed, inference failure
+        call_count = 0
+
+        def mock_retry_truncated(*args: Any, **kwargs: Any) -> StreamResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return StreamResult(
+                    content="",
+                    thinking="I should run a command to touch retry_never.txt",
+                    tool_calls=[],
+                    telemetry={
+                        "eval_count": 10,
+                        "prompt_eval_count": 10,
+                        "done": True,
+                        "done_reason": "stop",
+                    },
+                )
+            return StreamResult(
+                content="RUN: touch retry_should_not_run.txt",
+                thinking="",
+                tool_calls=[],
+                telemetry={
+                    "incomplete_stream": True,
+                    "done_reason": "stream_truncated_without_done",
+                    "done": False,
+                    "eval_count": 5,
+                    "prompt_eval_count": 20,
+                },
+            )
+
+        run_e = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=3,
+            max_wall=30,
+            run_dir=os.path.join(tmp, "retry_trunc"),
+            actuator="text",
+            verbose=False,
+            chat_fn=mock_retry_truncated,
+        )
+
+        if run_e["outcome"] != "inference_failure":
+            failures.append(
+                (
+                    "retry_truncation",
+                    f"expected outcome 'inference_failure', got {run_e['outcome']}",
+                    str(run_e),
+                )
+            )
+        if run_e.get("run_successful") or run_e.get("passed"):
+            failures.append(
+                (
+                    "retry_truncation",
+                    "run_successful or passed should be False on incomplete retry",
+                    str(run_e),
+                )
+            )
+        if os.path.exists(
+            os.path.join(tmp, "retry_trunc", "work", "retry_should_not_run.txt")
+        ):
+            failures.append(
+                (
+                    "retry_truncation",
+                    "command from truncated retry stream was executed!",
+                    "",
+                )
+            )
+
+        # 2. Valid patch followed by failed inference
+        # Step 1 applies solution; step 2 fails with incomplete stream.
+        # verification_passed must be True, but run_successful and passed False.
+        with open(os.path.join(meta["solution_dir"], "cache.py")) as f:
+            cache_code = f.read()
+
+        step_idx = 0
+
+        def mock_solve_then_fail(*args: Any, **kwargs: Any) -> StreamResult:
+            nonlocal step_idx
+            step_idx += 1
+            if step_idx == 1:
+                return StreamResult(
+                    content=f"RUN: cat << 'EOF' > cache.py\n{cache_code}\nEOF",
+                    thinking="applying fix",
+                    tool_calls=[],
+                    telemetry={
+                        "eval_count": 10,
+                        "prompt_eval_count": 10,
+                        "done": True,
+                        "done_reason": "stop",
+                    },
+                )
+            return StreamResult(
+                content="",
+                thinking="thinking...",
+                tool_calls=[],
+                telemetry={
+                    "incomplete_stream": True,
+                    "done_reason": "stream_truncated_without_done",
+                    "done": False,
+                    "eval_count": 5,
+                    "prompt_eval_count": 10,
+                },
+            )
+
+        run_f = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=4,
+            max_wall=30,
+            run_dir=os.path.join(tmp, "solve_then_fail"),
+            actuator="text",
+            verbose=False,
+            chat_fn=mock_solve_then_fail,
+        )
+
+        if not run_f.get("verification_passed"):
+            failures.append(
+                (
+                    "scoring_integrity",
+                    "verification_passed should be True because patch solved tests",
+                    str(run_f),
+                )
+            )
+        if run_f.get("run_successful") or run_f.get("passed"):
+            failures.append(
+                (
+                    "scoring_integrity",
+                    "run_successful and passed must be False due to inference error",
+                    str(run_f),
+                )
+            )
+        if run_f["outcome"] != "inference_failure":
+            failures.append(
+                (
+                    "scoring_integrity",
+                    f"expected outcome 'inference_failure', got {run_f['outcome']}",
+                    str(run_f),
+                )
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return failures
+
+
 def classifier_unit_tests() -> list[tuple[str, str, str]]:
     """Unit test failure classification outcome hierarchy and empirical cause rules."""
     failures = []
 
-    # 1. Passed task has no failure cause
+    # 1. Passed task has no failure cause but preserves diagnostic symptoms
     c_pass = classify_task_run(
         passed=True,
         timed_out=False,
@@ -316,6 +473,59 @@ def classifier_unit_tests() -> list[tuple[str, str, str]]:
     )
     if c_pass["outcome"] != "passed" or c_pass["possible_cause"] is not None:
         failures.append(("classifier", "passed classification failed", str(c_pass)))
+    if "symptoms" not in c_pass or not isinstance(c_pass["symptoms"], dict):
+        failures.append(("classifier", "symptoms missing on passed run", str(c_pass)))
+
+    # 1b. Passed task with earlier invalid actions preserves invalid_actions symptom
+    c_pass_invalid = classify_task_run(
+        passed=True,
+        timed_out=False,
+        step_count=4,
+        max_steps=20,
+        invalid_actions=2,
+        forbidden_files=[],
+        changed_files=["app.py"],
+        exit_status="OK",
+        steps=[],
+    )
+    if c_pass_invalid["outcome"] != "passed":
+        failures.append(
+            (
+                "classifier",
+                "passed with invalid actions outcome error",
+                str(c_pass_invalid),
+            )
+        )
+    if not c_pass_invalid.get("symptoms", {}).get("invalid_actions_detected"):
+        failures.append(
+            (
+                "classifier",
+                "invalid_actions_detected symptom not set on passed run",
+                str(c_pass_invalid),
+            )
+        )
+
+    # 1c. Inference error overrides passed outcome -> inference_failure
+    c_pass_err = classify_task_run(
+        passed=True,
+        timed_out=False,
+        step_count=2,
+        max_steps=20,
+        invalid_actions=0,
+        forbidden_files=[],
+        changed_files=["app.py"],
+        exit_status="OK",
+        steps=[],
+        inference_error="transport stream closed",
+    )
+    if c_pass_err["outcome"] != "inference_failure":
+        failures.append(
+            (
+                "classifier",
+                "inference_error did not override passed outcome",
+                str(c_pass_err),
+            )
+        )
 
     # 2. OOM / memory kill -> memory_failure + resource_constraint
     c_oom = classify_task_run(
@@ -351,6 +561,13 @@ def classifier_unit_tests() -> list[tuple[str, str, str]]:
         failures.append(
             ("classifier", "forbidden files classification failed", str(c_forbid))
         )
+
+    return failures
+
+
+def classifier_empirical_cause_tests() -> list[tuple[str, str, str]]:
+    """Unit test empirical cause attribution and symptom extraction rules."""
+    failures = []
 
     # 4. Repeated command loop -> repeated_command
     loop_steps = [
@@ -1122,6 +1339,79 @@ def sandbox_regression_checks() -> list[tuple[str, str, str]]:
     return failures
 
 
+def cgroup_background_child_termination_tests() -> list[tuple[str, str, str]]:
+    """Test background subprocess termination and cgroup cleanup failure reporting."""
+    failures: list[tuple[str, str, str]] = []
+    tmp = tempfile.mkdtemp(prefix="bench-cgroup-child-")
+    try:
+        work = os.path.join(tmp, "work")
+        os.makedirs(work, exist_ok=True)
+
+        # 1. Background child must not survive command timeout
+        bg_sleep_dur = 47
+        cmd = (
+            f'python3 -c "import subprocess, time; '
+            f"subprocess.Popen(['sleep', '{bg_sleep_dur}']); time.sleep(5)\""
+        )
+        code, out = run_sandboxed(work, cmd, timeout=1)
+        if code != -1:
+            failures.append(
+                ("cgroup_cleanup", f"expected timeout exit -1, got {code}", out)
+            )
+        if "[bench: command timed out after 1s]" not in out:
+            failures.append(
+                ("cgroup_cleanup", "missing timeout message in output", out)
+            )
+        if "[bench: cgroup cleanup failure:" in out:
+            failures.append(
+                ("cgroup_cleanup", f"unexpected cleanup failure reported: {out}", "")
+            )
+
+        time.sleep(0.3)
+        check_proc = subprocess.run(
+            ["pgrep", "-f", f"sleep {bg_sleep_dur}"],
+            capture_output=True,
+            text=True,
+        )
+        pids = check_proc.stdout.strip()
+        if check_proc.returncode == 0 and pids:
+            failures.append(
+                (
+                    "cgroup_cleanup",
+                    f"background child process survived timeout: PIDs {pids}",
+                    "",
+                )
+            )
+
+        # 2. Verify cleanup failure reporting when _kill_cgroup_scope fails
+        def _mock_fail(unit_name: str, timeout: float = 5.0) -> tuple[bool, str]:
+            return False, "mocked scope kill failure"
+
+        attr = "_kill_cgroup_scope"
+        orig_kill = bench_mod._kill_cgroup_scope
+        try:
+            setattr(bench_mod, attr, _mock_fail)
+            _, out_fail = run_sandboxed(work, "sleep 5", timeout=1)
+            if (
+                "[bench: cgroup cleanup failure: mocked scope kill failure]"
+                not in out_fail
+            ):
+                failures.append(
+                    (
+                        "cgroup_cleanup",
+                        "failed to report cleanup failure in output",
+                        out_fail,
+                    )
+                )
+        finally:
+            setattr(bench_mod, attr, orig_kill)
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return failures
+
+
 def attempt(
     meta: dict[str, Any], solution: bool
 ) -> tuple[int, str, dict[str, list[str]]]:
@@ -1175,8 +1465,12 @@ def main() -> int:
     print("Running premature stream closure tests...")
     failures.extend(premature_stream_closure_unit_tests())
 
+    print("Running retry stream & scoring integrity tests...")
+    failures.extend(retry_stream_and_scoring_integrity_tests())
+
     print("Running classifier unit tests...")
     failures.extend(classifier_unit_tests())
+    failures.extend(classifier_empirical_cause_tests())
 
     print("Running strict isolation checks...")
     failures.extend(strict_isolation_test())
@@ -1204,6 +1498,9 @@ def main() -> int:
 
     print("Running sandbox regression checks...")
     failures.extend(sandbox_regression_checks())
+
+    print("Running cgroup background child termination tests...")
+    failures.extend(cgroup_background_child_termination_tests())
 
     ids = all_tasks()
     print(f"Running golden solution checks for {len(ids)} tasks in parallel...")

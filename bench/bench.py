@@ -341,6 +341,37 @@ def _build_sandbox_command(
     return cmd, host_env
 
 
+def _kill_cgroup_scope(unit_name: str, timeout: float = 5.0) -> tuple[bool, str]:
+    """Terminate all processes in the named systemd cgroup scope."""
+    try:
+        res = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "kill",
+                "--signal=SIGKILL",
+                f"{unit_name}.scope",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if res.returncode == 0:
+            return True, ""
+        err = (res.stderr or res.stdout).strip()
+        # If the unit is already inactive, dead, or not found, processes are gone
+        if any(
+            msg in err.lower()
+            for msg in ("not loaded", "not found", "no such unit", "inactive")
+        ):
+            return True, ""
+        return False, f"systemctl kill failed (exit {res.returncode}): {err}"
+    except subprocess.TimeoutExpired:
+        return False, f"systemctl kill timed out after {timeout}s"
+    except Exception as e:
+        return False, f"systemctl kill error: {e}"
+
+
 def run_sandboxed(
     workdir: str,
     cmd: str,
@@ -378,21 +409,18 @@ def run_sandboxed(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            cleanup_err = ""
             if use_cgroup and unit_name:
-                subprocess.run(
-                    [
-                        "systemctl",
-                        "--user",
-                        "kill",
-                        "--signal=SIGKILL",
-                        f"{unit_name}.scope",
-                    ],
-                    capture_output=True,
-                )
+                ok, msg = _kill_cgroup_scope(unit_name)
+                if not ok:
+                    cleanup_err = f"\n[bench: cgroup cleanup failure: {msg}]"
             proc.kill()
             proc.wait()
             out = _read_output_tail(stdout_path)
-            return -1, f"{out}\n[bench: command timed out after {timeout}s]"
+            return (
+                -1,
+                f"{out}\n[bench: command timed out after {timeout}s]{cleanup_err}",
+            )
         out = _read_output_tail(stdout_path)
         return proc.returncode, out
     except Exception as e:
@@ -401,16 +429,7 @@ def run_sandboxed(
         return -1, f"[bench: spawn error: {e}]"
     finally:
         if use_cgroup and unit_name:
-            subprocess.run(
-                [
-                    "systemctl",
-                    "--user",
-                    "kill",
-                    "--signal=SIGKILL",
-                    f"{unit_name}.scope",
-                ],
-                capture_output=True,
-            )
+            _kill_cgroup_scope(unit_name)
 
 
 def assert_sandbox_python(
@@ -1105,6 +1124,7 @@ def run_task(
 
             # --- Actuator: Text (RUN: / DONE) ---
             kind, cmd = parse_action(reply)
+            active_telemetry = res.telemetry
             if kind is None and thinking and not reply.strip():
                 rem_retry = max(1, int(max_wall - (time.time() - t0)))
                 retry_msgs = [
@@ -1118,20 +1138,44 @@ def run_task(
                         ),
                     },
                 ]
-                res_retry = chat_fn(
-                    model,
-                    retry_msgs,
-                    ctx,
-                    ngpu,
-                    sampling=sampling,
-                    timeout=min(1800, rem_retry),
-                    step=steps,
-                    request_idx=request_count,
-                )
+                try:
+                    res_retry = chat_fn(
+                        model,
+                        retry_msgs,
+                        ctx,
+                        ngpu,
+                        sampling=sampling,
+                        timeout=min(1800, rem_retry),
+                        step=steps,
+                        request_idx=request_count,
+                    )
+                except Exception as e:
+                    inference_error = str(e)
+                    break
                 telemetry_records.append(res_retry.telemetry)
                 tokens += res_retry.telemetry.get(
                     "eval_count", 0
                 ) + res_retry.telemetry.get("prompt_eval_count", 0)
+                active_telemetry = res_retry.telemetry
+
+                # Centralized response-integrity check applies to retry streams
+                if res_retry.telemetry.get("incomplete_stream"):
+                    inference_error = (
+                        "Inference stream closed prematurely without done event (retry)"
+                    )
+                    step_entry = {
+                        "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
+                        "reply": res_retry.content,
+                        "thinking": thinking,
+                        "action": "incomplete_stream_rejected",
+                        "telemetry": res_retry.telemetry,
+                    }
+                    step_records.append(step_entry)
+                    transcript.append(step_entry)
+                    break
+
                 reply = res_retry.content
                 kind, cmd = parse_action(reply)
 
@@ -1142,7 +1186,7 @@ def run_task(
                 "reply": reply,
                 "thinking": thinking,
                 "action": kind,
-                "telemetry": res.telemetry,
+                "telemetry": active_telemetry,
             }
             if kind == "done":
                 transcript.append(step_entry)
@@ -1169,34 +1213,25 @@ def run_task(
 
             if commands_executed >= max_commands:
                 invalid += 1
-                step_entry["command_budget_exhausted"] = True
+                feed = (
+                    f"Error: Shell command budget exhausted ({max_commands} "
+                    f"commands limit reached)."
+                )
+                step_entry["command"] = cmd
+                step_entry["code"] = -1
+                step_entry["output"] = feed
+                step_records.append(step_entry)
                 transcript.append(step_entry)
                 msgs.append({"role": "assistant", "content": reply})
-                msgs.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Error: Shell command budget exhausted "
-                            f"({max_commands} commands limit). "
-                            "Output 'DONE' to finish."
-                        ),
-                    }
-                )
+                msgs.append({"role": "user", "content": feed})
                 continue
 
             commands_executed += 1
-            budget = max(
-                1,
-                min(
-                    meta.get("cmd_timeout_s", 60),
-                    int(rem_cmd),
-                ),
-            )
             code, out = run_sandboxed(
                 work,
                 cmd,
-                budget,
-                os.path.join(run_dir, "cmd-out"),
+                timeout=min(60, max(1, int(rem_cmd))),
+                outdir=os.path.join(run_dir, f"cmd_{tool_calls}"),
                 strict_isolation=strict_isolation,
             )
             feed = f"[exit={code}]\n{out}" if out else f"[exit={code}]"
@@ -1218,7 +1253,10 @@ def run_task(
     diff = policy_check(meta, work, run_dir)
     verification_wall_s = time.time() - t_verify_start
     total_wall_s = time.time() - t0
-    passed = tests_ok and not diff["forbidden"]
+
+    verification_passed = bool(tests_ok and not diff["forbidden"])
+    run_successful = bool(verification_passed and not inference_error and not timed_out)
+    passed = run_successful
 
     infer_summary = summarize_inference(telemetry_records)
     offload_info = get_ollama_offload_status(model)
@@ -1245,6 +1283,9 @@ def run_task(
                 "task_digest": digest,
                 "actuator": actuator,
                 "sampling": sampling.to_dict(),
+                "verification_passed": verification_passed,
+                "run_successful": run_successful,
+                "inference_error": inference_error,
                 "steps": transcript,
                 "inference_telemetry": telemetry_records,
                 "classification": classification,
@@ -1258,7 +1299,10 @@ def run_task(
     rec = {
         "task": meta["id"],
         "task_digest": digest,
-        "passed": passed,
+        "passed": run_successful,
+        "run_successful": run_successful,
+        "verification_passed": verification_passed,
+        "inference_error": inference_error,
         "outcome": classification["outcome"],
         "possible_cause": classification["possible_cause"],
         "cause_evidence": classification["evidence"],
@@ -1305,9 +1349,7 @@ def run_task(
             else ""
         )
         fail_desc = (
-            f" {classification['outcome']}{cause_suffix}"
-            if not tests_ok or diff["forbidden"]
-            else ""
+            f" {classification['outcome']}{cause_suffix}" if not run_successful else ""
         )
         print(
             f"  {'PASS' if passed else 'FAIL'}  {meta['id']:24s} "

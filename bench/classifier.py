@@ -62,13 +62,11 @@ def classify_task_run(
     evidence: list[str] = []
 
     # 1. Determine Observed Outcome
-    if passed:
-        outcome = "passed"
-        return {"outcome": outcome, "possible_cause": None, "evidence": []}
-
     if inference_error:
         outcome = "inference_failure"
         evidence.append(f"inference transport error: {inference_error}")
+    elif passed:
+        outcome = "passed"
     elif "cgroup: oom-kill" in exit_status.lower() or "killed" in exit_status.lower():
         outcome = "memory_failure"
         evidence.append(f"command killed by memory limit: {exit_status}")
@@ -131,7 +129,7 @@ def classify_task_run(
     # Physical resource exhaustion or repeated invalid tool syntax are conclusive;
     # code failure, test failure, or context pressure do NOT establish cause
     # without controlled ablation.
-    cause = "unknown"
+    cause: str | None = None if outcome == "passed" else "unknown"
     if outcome == "memory_failure":
         cause = "resource_constraint"
         evidence.append("cgroup/memory ceiling breached during execution")
