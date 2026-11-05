@@ -76,11 +76,11 @@ a private `/tmp`, the worktree bound at `/mnt/work`, and `--unshare-net`.
 ## Usage
 
 ```bash
-# List available tasks
-uv run python bench/bench.py --list
+# Run all benchmark tasks
+uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99
 
 # Run single task with deterministic sampling and streaming telemetry
-uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --tasks debugging-default-arg
+uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --task debugging-default-arg
 
 # Compare actuators (Arm A vs Arm B)
 uv run python bench/bench.py --model qwen3.5:4b --actuator text --tag text-arm

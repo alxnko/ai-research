@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -310,6 +311,7 @@ def _build_sandbox_command(
     workdir: str,
     outdir: str,
     use_cgroup: bool,
+    unit_name: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     base_bwrap = bwrap_cmd(workdir, ["bash", "/mnt/out/run.sh"], outdir)
     host_env = {
@@ -328,6 +330,7 @@ def _build_sandbox_command(
         "--user",
         "--scope",
         "-q",
+        *(["--unit", unit_name] if unit_name else []),
         "-p",
         "MemoryMax=4G",
         "-p",
@@ -359,8 +362,11 @@ def run_sandboxed(
             "but not functional"
         )
     use_cgroup = cgroup_ok
+    unit_name = f"bench-cmd-{uuid.uuid4().hex[:12]}" if use_cgroup else None
     _write_runner_script(script_path, stdout_path, cmd, use_cgroup)
-    bwrap_full, host_env = _build_sandbox_command(workdir, outdir, use_cgroup)
+    bwrap_full, host_env = _build_sandbox_command(
+        workdir, outdir, use_cgroup, unit_name=unit_name
+    )
 
     try:
         proc = subprocess.Popen(
@@ -372,6 +378,17 @@ def run_sandboxed(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            if use_cgroup and unit_name:
+                subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "kill",
+                        "--signal=SIGKILL",
+                        f"{unit_name}.scope",
+                    ],
+                    capture_output=True,
+                )
             proc.kill()
             proc.wait()
             out = _read_output_tail(stdout_path)
@@ -382,27 +399,46 @@ def run_sandboxed(
         if strict_isolation and use_cgroup:
             raise RuntimeError(f"Strict isolation spawn failure: {e}") from e
         return -1, f"[bench: spawn error: {e}]"
+    finally:
+        if use_cgroup and unit_name:
+            subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    f"{unit_name}.scope",
+                ],
+                capture_output=True,
+            )
 
 
-def assert_sandbox_python(workdir: str, strict_isolation: bool = False) -> str:
-    """Assert sandbox python runs and matches the required interpreter."""
+def assert_sandbox_python(
+    workdir: str, strict_isolation: bool = False
+) -> dict[str, str]:
+    """Assert sandbox python runs, matches host version, and records executable."""
     code, out = run_sandboxed(
         workdir,
-        'python3 -c "import sys; print(sys.version.split()[0])"',
+        'python3 -c "import sys; print(sys.version.split()[0]); print(sys.executable)"',
         timeout=10,
         strict_isolation=strict_isolation,
     )
     if code != 0:
         raise RuntimeError(f"Sandbox Python initialization failed (exit={code}): {out}")
-    sandbox_ver = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    sandbox_ver = lines[0] if lines else ""
+    sandbox_exe = lines[1] if len(lines) > 1 else ""
     host_ver = sys.version.split()[0]
-    sb_major_minor = ".".join(sandbox_ver.split(".")[:2])
-    host_major_minor = ".".join(host_ver.split(".")[:2])
-    if sb_major_minor != host_major_minor:
+    if sandbox_ver != host_ver:
         raise RuntimeError(
             f"Sandbox Python version mismatch: sandbox={sandbox_ver}, host={host_ver}"
         )
-    return sandbox_ver
+    return {
+        "sandbox_python_version": sandbox_ver,
+        "sandbox_python_executable": sandbox_exe,
+        "host_python_version": host_ver,
+        "host_python_executable": sys.executable,
+    }
 
 
 def git_snapshot(workdir: str) -> dict[str, Any]:
@@ -584,9 +620,10 @@ def policy_check(meta: dict[str, Any], workdir: str, run_dir: str) -> dict[str, 
             if os.path.islink(p) or not os.path.isfile(p):
                 special_or_symlinks.append(os.path.relpath(p, workdir))
 
-    touched = changed + added + removed + special_or_symlinks
     allowed = set(meta.get("allowed_files", []))
-    forbidden = [p for p in touched if allowed and p not in allowed]
+    forbidden = [p for p in (changed + added + removed) if allowed and p not in allowed]
+    # Unconditionally reject new or altered special filesystem entries and symlinks
+    forbidden.extend(special_or_symlinks)
 
     return {
         "changed": changed,
@@ -746,6 +783,9 @@ def run_task(
 
     t0 = time.time()
     steps = 0
+    model_turns = 0
+    commands_executed = 0
+    max_commands = max_steps
     tokens = 0
     tool_calls = 0
     invalid = 0
@@ -756,7 +796,7 @@ def run_task(
     inference_error: str | None = None
 
     try:
-        while steps < max_steps:
+        while model_turns < max_steps:
             rem = max_wall - (time.time() - t0)
             if rem <= 0:
                 timed_out = True
@@ -773,7 +813,7 @@ def run_task(
                     sampling=sampling,
                     tools=tools_arg,
                     timeout=min(1800, max(1, int(rem))),
-                    step=steps,
+                    step=model_turns,
                     request_idx=request_count,
                 )
             except Exception as e:
@@ -784,11 +824,30 @@ def run_task(
             tokens += res.telemetry.get("eval_count", 0) + res.telemetry.get(
                 "prompt_eval_count", 0
             )
-            steps += 1
+            model_turns += 1
+            steps = model_turns
 
             reply = res.content
             thinking = res.thinking
             tool_calls_list = res.tool_calls
+
+            # Incomplete streams are rejected immediately and cannot trigger execution
+            if res.telemetry.get("incomplete_stream"):
+                inference_error = (
+                    "Inference stream closed prematurely without done event"
+                )
+                step_entry = {
+                    "step": steps,
+                    "model_turns": model_turns,
+                    "commands_executed": commands_executed,
+                    "reply": reply,
+                    "thinking": thinking,
+                    "action": "incomplete_stream_rejected",
+                    "telemetry": res.telemetry,
+                }
+                step_records.append(step_entry)
+                transcript.append(step_entry)
+                break
 
             # --- Actuator: Native Tools ---
             if actuator == "native_tools":
@@ -796,6 +855,8 @@ def run_task(
                     invalid += 1
                     step_entry = {
                         "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
                         "reply": reply,
                         "thinking": thinking,
                         "action": "invalid_no_tool_call",
@@ -820,6 +881,79 @@ def run_task(
                     )
                     continue
 
+                # Ambiguous batching rule: finish_task cannot coexist with other calls
+                has_finish = any(
+                    c.get("function", {}).get("name") == "finish_task"
+                    for c in tool_calls_list
+                )
+                if has_finish and len(tool_calls_list) > 1:
+                    invalid += 1
+                    err_msg = (
+                        "Protocol error: 'finish_task' cannot be batched with other "
+                        "tool calls. Batch rejected."
+                    )
+                    step_entry = {
+                        "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
+                        "action": "invalid_mixed_finish_batch",
+                        "tool_calls": tool_calls_list,
+                        "telemetry": res.telemetry,
+                    }
+                    step_records.append(step_entry)
+                    transcript.append(step_entry)
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": reply or "",
+                        "tool_calls": tool_calls_list,
+                    }
+                    if thinking:
+                        assistant_msg["thinking"] = thinking
+                    msgs.append(assistant_msg)
+                    for c_idx, c in enumerate(tool_calls_list):
+                        c_id = c.get("id", f"call_{steps}_{c_idx}")
+                        msgs.append(
+                            {
+                                "role": "tool",
+                                "content": err_msg,
+                                "tool_name": c.get("function", {}).get("name", "tool"),
+                                "tool_call_id": c_id,
+                            }
+                        )
+                    continue
+
+                if has_finish and len(tool_calls_list) == 1:
+                    call = tool_calls_list[0]
+                    call_id = call.get("id", f"call_{steps}_0")
+                    tool_calls += 1
+                    step_record = {
+                        "step": steps,
+                        "model_turns": model_turns,
+                        "commands_executed": commands_executed,
+                        "action": "done",
+                        "tool_call": call,
+                        "telemetry": res.telemetry,
+                    }
+                    step_records.append(step_record)
+                    transcript.append(step_record)
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": reply or "",
+                        "tool_calls": tool_calls_list,
+                    }
+                    if thinking:
+                        assistant_msg["thinking"] = thinking
+                    msgs.append(assistant_msg)
+                    msgs.append(
+                        {
+                            "role": "tool",
+                            "content": "Task completed.",
+                            "tool_name": "finish_task",
+                            "tool_call_id": call_id,
+                        }
+                    )
+                    break
+
                 assistant_msg = {
                     "role": "assistant",
                     "content": reply or "",
@@ -829,8 +963,15 @@ def run_task(
                     assistant_msg["thinking"] = thinking
                 msgs.append(assistant_msg)
 
-                finish_invoked = False
+                batch_timed_out = False
                 for call_idx, call in enumerate(tool_calls_list):
+                    # Check remaining wall-clock budget before each command in batch
+                    rem_cmd = max_wall - (time.time() - t0)
+                    if rem_cmd <= 0:
+                        timed_out = True
+                        batch_timed_out = True
+                        break
+
                     call_id = call.get("id", f"call_{steps}_{call_idx}")
                     fn = call.get("function", {})
                     fn_name = fn.get("name", "")
@@ -843,25 +984,9 @@ def run_task(
                     if not isinstance(fn_args, dict):
                         fn_args = {}
 
-                    if fn_name == "finish_task":
-                        finish_invoked = True
-                        step_record = {
-                            "step": steps,
-                            "action": "done",
-                            "tool_call": call,
-                            "telemetry": res.telemetry,
-                        }
-                        step_records.append(step_record)
-                        transcript.append(step_record)
-                        msgs.append(
-                            {
-                                "role": "tool",
-                                "content": "Task completed.",
-                                "tool_name": fn_name,
-                                "tool_call_id": call_id,
-                            }
-                        )
-                    elif fn_name == "execute_command":
+                    tool_calls += 1
+
+                    if fn_name == "execute_command":
                         cmd = fn_args.get("command")
                         if not isinstance(cmd, str) or not cmd.strip():
                             invalid += 1
@@ -870,6 +995,8 @@ def run_task(
                             )
                             step_record = {
                                 "step": steps,
+                                "model_turns": model_turns,
+                                "commands_executed": commands_executed,
                                 "tool_call": call,
                                 "invalid_argument": True,
                                 "telemetry": res.telemetry,
@@ -884,13 +1011,39 @@ def run_task(
                                     "tool_call_id": call_id,
                                 }
                             )
+                        elif commands_executed >= max_commands:
+                            invalid += 1
+                            err_msg = (
+                                f"Error: Shell command budget exhausted "
+                                f"({max_commands} commands limit). "
+                                "No more commands may be executed. "
+                                "Call 'finish_task' to conclude."
+                            )
+                            step_record = {
+                                "step": steps,
+                                "model_turns": model_turns,
+                                "commands_executed": commands_executed,
+                                "tool_call": call,
+                                "command_budget_exhausted": True,
+                                "telemetry": res.telemetry,
+                            }
+                            step_records.append(step_record)
+                            transcript.append(step_record)
+                            msgs.append(
+                                {
+                                    "role": "tool",
+                                    "content": err_msg,
+                                    "tool_name": fn_name,
+                                    "tool_call_id": call_id,
+                                }
+                            )
                         else:
-                            tool_calls += 1
+                            commands_executed += 1
                             budget = max(
                                 1,
                                 min(
                                     meta.get("cmd_timeout_s", 60),
-                                    int(max_wall - (time.time() - t0)),
+                                    int(rem_cmd),
                                 ),
                             )
                             code, out = run_sandboxed(
@@ -903,6 +1056,8 @@ def run_task(
                             feed = f"[exit={code}]\n{out}" if out else f"[exit={code}]"
                             step_record = {
                                 "step": steps,
+                                "model_turns": model_turns,
+                                "commands_executed": commands_executed,
                                 "command": cmd,
                                 "code": code,
                                 "output": out,
@@ -927,6 +1082,8 @@ def run_task(
                         )
                         step_record = {
                             "step": steps,
+                            "model_turns": model_turns,
+                            "commands_executed": commands_executed,
                             "tool_call": call,
                             "unknown_tool": True,
                             "telemetry": res.telemetry,
@@ -942,7 +1099,7 @@ def run_task(
                             }
                         )
 
-                if finish_invoked:
+                if batch_timed_out:
                     break
                 continue
 
@@ -980,6 +1137,8 @@ def run_task(
 
             step_entry: dict[str, Any] = {
                 "step": steps,
+                "model_turns": model_turns,
+                "commands_executed": commands_executed,
                 "reply": reply,
                 "thinking": thinking,
                 "action": kind,
@@ -1003,11 +1162,34 @@ def run_task(
                 continue
 
             tool_calls += 1
+            rem_cmd = max_wall - (time.time() - t0)
+            if rem_cmd <= 0:
+                timed_out = True
+                break
+
+            if commands_executed >= max_commands:
+                invalid += 1
+                step_entry["command_budget_exhausted"] = True
+                transcript.append(step_entry)
+                msgs.append({"role": "assistant", "content": reply})
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Error: Shell command budget exhausted "
+                            f"({max_commands} commands limit). "
+                            "Output 'DONE' to finish."
+                        ),
+                    }
+                )
+                continue
+
+            commands_executed += 1
             budget = max(
                 1,
                 min(
                     meta.get("cmd_timeout_s", 60),
-                    int(max_wall - (time.time() - t0)),
+                    int(rem_cmd),
                 ),
             )
             code, out = run_sandboxed(
@@ -1084,7 +1266,10 @@ def run_task(
         "strict_isolation": strict_isolation,
         "actuator": actuator,
         "sampling": sampling.to_dict(),
-        "steps": steps,
+        "steps": model_turns,
+        "model_turns": model_turns,
+        "commands_executed": commands_executed,
+        "max_commands": max_commands,
         "tokens": tokens,
         "agent_wall_s": round(agent_wall_s, 2),
         "verification_wall_s": round(verification_wall_s, 2),
@@ -1094,6 +1279,9 @@ def run_task(
         "peak_device_vram_mib": vram_data.get("peak_device_vram_mib"),
         "peak_ollama_vram_mib": vram_data.get("peak_ollama_vram_mib"),
         "gpu_telemetry_status": vram_data.get("telemetry_status"),
+        "monitor_sample_count": vram_data.get("monitor_sample_count"),
+        "monitor_max_sample_gap_s": vram_data.get("monitor_max_sample_gap_s"),
+        "monitor_overhead_s": vram_data.get("monitor_overhead_s"),
         "reported_vram_size_ratio": offload_info.get("reported_vram_size_ratio"),
         "runner": offload_info.get("runner"),
         "tool_calls": tool_calls,
@@ -1365,7 +1553,7 @@ def main() -> int:
     init_check_dir = os.path.join(run_dir, ".init-check")
     os.makedirs(init_check_dir, exist_ok=True)
     try:
-        sandbox_py_ver = assert_sandbox_python(
+        py_info = assert_sandbox_python(
             init_check_dir, strict_isolation=cfg.get("strict_isolation", False)
         )
     finally:
@@ -1376,7 +1564,8 @@ def main() -> int:
     env["model_fingerprint"] = fp
     env["model_digest"] = fp["weights_digest"] or fp["config_digest"]
     env["strict_isolation"] = cfg.get("strict_isolation", False)
-    env["sandbox_python"] = sandbox_py_ver
+    env.update(py_info)
+    env["sandbox_python"] = py_info["sandbox_python_version"]
     env["host_python_exact"] = sys.version
 
     env_path = os.path.join(run_dir, "env.json")
@@ -1392,7 +1581,8 @@ def main() -> int:
         f"actuator={actuator}  sampling={sampling.profile} "
         f"(temp={sampling.temperature})\n"
         f"host={env['gpu']} (driver {env['nvidia_driver']})  "
-        f"python={env['python']} (sandbox={sandbox_py_ver})  isolation={iso}\n",
+        f"python={env['python']} (sandbox={env['sandbox_python']})  "
+        f"isolation={iso}\n",
         flush=True,
     )
 

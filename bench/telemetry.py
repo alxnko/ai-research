@@ -149,8 +149,10 @@ def build_telemetry_record(
     eval_count = state.get("eval_count", 0)
     prompt_count = state.get("prompt_eval_count", 0)
     done = state.get("done", False)
-    default_reason = "stream_truncated_without_done" if not done else "unknown"
-    done_reason = state.get("done_reason", default_reason)
+    if not done:
+        done_reason = "stream_truncated_without_done"
+    else:
+        done_reason = state.get("done_reason") or "stop"
 
     decode_tps = round(eval_count / eval_dur_s, 2) if eval_dur_s > 0 else 0.0
     prompt_tps = round(prompt_count / prompt_dur_s, 2) if prompt_dur_s > 0 else 0.0
@@ -230,7 +232,7 @@ def chat_stream(
         "ttft_thinking_s": None,
         "ttft_content_s": None,
         "ttft_tool_s": None,
-        "done_reason": "stop",
+        "done_reason": None,
         "prompt_eval_count": 0,
         "prompt_eval_cached_count": 0,
         "prompt_eval_duration_ns": 0,
@@ -309,6 +311,13 @@ def summarize_inference(records: list[dict[str, Any]]) -> dict[str, Any]:
     done_reasons = [r.get("done_reason", "unknown") for r in records]
     max_prompt = max((r.get("prompt_eval_count", 0) for r in records), default=0)
 
+    token_weighted_decode_tps = (
+        round(total_eval / total_eval_dur, 2) if total_eval_dur > 0 else 0.0
+    )
+    token_weighted_prompt_tps = (
+        round(total_prompt / total_prompt_dur, 2) if total_prompt_dur > 0 else 0.0
+    )
+
     return {
         "total_requests": len(records),
         "total_prompt_tokens": total_prompt,
@@ -317,6 +326,8 @@ def summarize_inference(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_ttft_s": mean_ttft,
         "mean_decode_tokens_per_s": mean_decode_tps,
         "mean_prompt_eval_tokens_per_s": mean_prompt_tps,
+        "token_weighted_decode_tokens_per_s": token_weighted_decode_tps,
+        "token_weighted_prompt_eval_tokens_per_s": token_weighted_prompt_tps,
         "total_eval_duration_s": round(total_eval_dur, 4),
         "total_prompt_eval_duration_s": round(total_prompt_dur, 4),
         "done_reasons": done_reasons,
@@ -518,10 +529,25 @@ class VramMonitor:
             else ("nvidia-smi" if self.telemetry_status == "available" else "none")
         )
         self._thread: threading.Thread | None = None
+        self.sample_count = 0
+        self.max_sample_gap_s = 0.0
+        self.total_query_time_s = 0.0
+        self.last_sample_time: float | None = None
 
     def _sample(self) -> None:
         while not self.stop_event.is_set():
+            t_now = time.time()
+            if self.last_sample_time is not None:
+                gap = t_now - self.last_sample_time
+                self.max_sample_gap_s = max(self.max_sample_gap_s, gap)
+            self.last_sample_time = t_now
+
+            t_query_start = time.perf_counter()
             metrics = get_gpu_memory()
+            query_dur = time.perf_counter() - t_query_start
+            self.total_query_time_s += query_dur
+            self.sample_count += 1
+
             dev_used = metrics.get("device_vram_used_mib")
             if dev_used is not None:
                 self.peak_device_vram = max(self.peak_device_vram or 0, dev_used)
@@ -546,4 +572,7 @@ class VramMonitor:
             "peak_ollama_vram_mib": self.peak_ollama_vram,
             "telemetry_status": self.telemetry_status,
             "telemetry_source": self.telemetry_source,
+            "monitor_sample_count": self.sample_count,
+            "monitor_max_sample_gap_s": round(self.max_sample_gap_s, 4),
+            "monitor_overhead_s": round(self.total_query_time_s, 4),
         }

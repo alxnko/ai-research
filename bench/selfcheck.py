@@ -38,6 +38,7 @@ from bench.telemetry import (
     StreamResult,
     build_telemetry_record,
     parse_stream_chunk_event,
+    summarize_inference,
 )
 
 
@@ -84,7 +85,7 @@ def streaming_parser_unit_tests() -> list[tuple[str, str, str]]:
         "ttft_thinking_s": None,
         "ttft_content_s": None,
         "ttft_tool_s": None,
-        "done_reason": "stop",
+        "done_reason": None,
         "prompt_eval_count": 0,
         "prompt_eval_cached_count": 0,
         "prompt_eval_duration_ns": 0,
@@ -95,12 +96,7 @@ def streaming_parser_unit_tests() -> list[tuple[str, str, str]]:
     }
     t0 = time.perf_counter()
 
-    # 1. Thinking chunk
-    parse_stream_chunk_event(
-        {"message": {"thinking": "analyzing..."}},
-        t0,
-        state,
-    )
+    parse_stream_chunk_event({"message": {"thinking": "analyzing..."}}, t0, state)
     if state["thinking"] != "analyzing...":
         failures.append(
             ("streaming_parser", "thinking text mismatch", state["thinking"])
@@ -108,18 +104,12 @@ def streaming_parser_unit_tests() -> list[tuple[str, str, str]]:
     if state["ttft_thinking_s"] is None or state["ttft_any_s"] is None:
         failures.append(("streaming_parser", "ttft_thinking not recorded", str(state)))
 
-    # 2. Content chunk
-    parse_stream_chunk_event(
-        {"message": {"content": "RUN: ls"}},
-        t0,
-        state,
-    )
+    parse_stream_chunk_event({"message": {"content": "RUN: ls"}}, t0, state)
     if state["content"] != "RUN: ls":
         failures.append(("streaming_parser", "content text mismatch", state["content"]))
     if state["ttft_content_s"] is None:
         failures.append(("streaming_parser", "ttft_content not recorded", str(state)))
 
-    # 3. Tool call chunk
     tool_chunk = {
         "message": {
             "tool_calls": [
@@ -141,7 +131,6 @@ def streaming_parser_unit_tests() -> list[tuple[str, str, str]]:
     if state["ttft_tool_s"] is None:
         failures.append(("streaming_parser", "ttft_tool not recorded", str(state)))
 
-    # 4. Final done chunk
     done_chunk = {
         "done": True,
         "done_reason": "stop",
@@ -164,6 +153,147 @@ def streaming_parser_unit_tests() -> list[tuple[str, str, str]]:
         failures.append(("streaming_parser", "decode_tps mismatch", str(rec)))
     if rec["prompt_eval_tokens_per_s"] != 100.0:  # 50 / 0.5s = 100
         failures.append(("streaming_parser", "prompt_eval_tps mismatch", str(rec)))
+    if rec["incomplete_stream"]:
+        failures.append(
+            ("streaming_parser", "completed stream marked as incomplete", str(rec))
+        )
+
+    infer_summary = summarize_inference([rec])
+    if "token_weighted_decode_tokens_per_s" not in infer_summary:
+        failures.append(
+            (
+                "streaming_parser",
+                "token_weighted_decode_tokens_per_s missing",
+                str(infer_summary),
+            )
+        )
+    return failures
+
+
+def premature_stream_closure_unit_tests() -> list[tuple[str, str, str]]:
+    """Test premature stream truncation detection and execution rejection."""
+    failures = []
+    base_state: dict[str, Any] = {
+        "content": "",
+        "thinking": "",
+        "tool_calls": [],
+        "done": False,
+        "ttft_any_s": 0.05,
+        "ttft_thinking_s": None,
+        "ttft_content_s": None,
+        "ttft_tool_s": None,
+        "done_reason": None,
+        "prompt_eval_count": 10,
+        "prompt_eval_cached_count": 0,
+        "prompt_eval_duration_ns": 100_000_000,
+        "eval_count": 5,
+        "eval_duration_ns": 50_000_000,
+        "total_duration_ns": 150_000_000,
+        "load_duration_ns": 10_000_000,
+    }
+
+    # Case A: truncated after thinking
+    st_a = dict(base_state, thinking="partial thought...", ttft_thinking_s=0.05)
+    rec_a = build_telemetry_record(st_a, wall_duration_s=0.2, step=1, request_idx=1)
+    if not rec_a["incomplete_stream"] or rec_a["done_reason"] != (
+        "stream_truncated_without_done"
+    ):
+        failures.append(
+            ("stream_truncation", "thinking truncation not flagged", str(rec_a))
+        )
+
+    # Case B: truncated after content
+    st_b = dict(base_state, content="RUN: echo 1", ttft_content_s=0.08)
+    rec_b = build_telemetry_record(st_b, wall_duration_s=0.3, step=1, request_idx=1)
+    if not rec_b["incomplete_stream"] or rec_b["done_reason"] != (
+        "stream_truncated_without_done"
+    ):
+        failures.append(
+            ("stream_truncation", "content truncation not flagged", str(rec_b))
+        )
+
+    # Case C: truncated after tool call
+    st_c = dict(
+        base_state,
+        tool_calls=[{"id": "c1", "function": {"name": "execute_command"}}],
+        ttft_tool_s=0.09,
+    )
+    rec_c = build_telemetry_record(st_c, wall_duration_s=0.4, step=1, request_idx=1)
+    if not rec_c["incomplete_stream"] or rec_c["done_reason"] != (
+        "stream_truncated_without_done"
+    ):
+        failures.append(
+            ("stream_truncation", "tool call truncation not flagged", str(rec_c))
+        )
+
+    # Case D: End-to-end incomplete stream rejection in run_task
+    tmp = tempfile.mkdtemp(prefix="bench-incomplete-stream-")
+    try:
+        meta = load_task("debugging-default-arg")
+
+        def mock_truncated_stream(*args: Any, **kwargs: Any) -> StreamResult:
+            return StreamResult(
+                content="",
+                thinking="thinking truncated...",
+                tool_calls=[
+                    {
+                        "id": "c_trunc",
+                        "function": {
+                            "name": "execute_command",
+                            "arguments": {"command": "touch should_never_exist.txt"},
+                        },
+                    }
+                ],
+                telemetry={
+                    "incomplete_stream": True,
+                    "done_reason": "stream_truncated_without_done",
+                    "done": False,
+                    "eval_count": 5,
+                    "prompt_eval_count": 10,
+                },
+            )
+
+        run_res = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=3,
+            max_wall=30,
+            run_dir=os.path.join(tmp, "trunc_run"),
+            actuator="native_tools",
+            verbose=False,
+            chat_fn=mock_truncated_stream,
+        )
+
+        if run_res["outcome"] != "inference_failure":
+            failures.append(
+                (
+                    "stream_truncation",
+                    f"expected outcome 'inference_failure', got {run_res['outcome']}",
+                    str(run_res),
+                )
+            )
+        if not run_res.get("symptoms", {}).get("incomplete_stream"):
+            failures.append(
+                (
+                    "stream_truncation",
+                    "symptom 'incomplete_stream' was not True",
+                    str(run_res),
+                )
+            )
+        if os.path.exists(
+            os.path.join(tmp, "trunc_run", "work", "should_never_exist.txt")
+        ):
+            failures.append(
+                (
+                    "stream_truncation",
+                    "partial command from truncated stream was executed!",
+                    "",
+                )
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     return failures
 
@@ -584,20 +714,27 @@ def gitignore_unit_tests() -> list[tuple[str, str, str]]:
 
 
 def sandbox_python_assertion_tests() -> list[tuple[str, str, str]]:
-    """Ensure sandbox Python interpreter is executable and matches required version."""
+    """Ensure sandbox Python interpreter runs and matches host version."""
     failures = []
     tmp = tempfile.mkdtemp(prefix="bench-pyassert-")
     try:
-        ver = assert_sandbox_python(tmp)
+        py_info = assert_sandbox_python(tmp)
         host_ver = sys.version.split()[0]
-        sb_major_minor = ".".join(ver.split(".")[:2])
-        host_major_minor = ".".join(host_ver.split(".")[:2])
-        if sb_major_minor != host_major_minor:
+        sb_ver = py_info["sandbox_python_version"]
+        if sb_ver != host_ver:
             failures.append(
                 (
                     "sandbox_python",
-                    f"version mismatch: sandbox={ver} host={host_ver}",
+                    f"exact version mismatch: sandbox={sb_ver} host={host_ver}",
                     "",
+                )
+            )
+        if not py_info.get("sandbox_python_executable"):
+            failures.append(
+                (
+                    "sandbox_python",
+                    "sandbox_python_executable path missing",
+                    str(py_info),
                 )
             )
     except Exception as e:
@@ -608,7 +745,7 @@ def sandbox_python_assertion_tests() -> list[tuple[str, str, str]]:
 
 
 def native_tool_fairness_unit_tests() -> list[tuple[str, str, str]]:
-    """Test strict native tools actuator: multi-call, schema validation, no fallback."""
+    """Test strict native tools actuator: budget parity, finish batch rule, timeout."""
     failures = []
     tmp = tempfile.mkdtemp(prefix="bench-tool-fairness-")
     meta = load_task("debugging-default-arg")
@@ -688,6 +825,122 @@ def native_tool_fairness_unit_tests() -> list[tuple[str, str, str]]:
                     ("tool_fairness", f"tool_call_ids mismatch: {tool_ids}", "")
                 )
 
+        # 2. Command execution budget parity test
+        # Model emits 3 commands in 1 turn, but max_steps (and thus max_commands) is 2
+        def mock_budget_overflow(*args: Any, **kwargs: Any) -> StreamResult:
+            return StreamResult(
+                content="",
+                thinking="",
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "function": {
+                            "name": "execute_command",
+                            "arguments": {"command": "echo 'cmd1'"},
+                        },
+                    },
+                    {
+                        "id": "c2",
+                        "function": {
+                            "name": "execute_command",
+                            "arguments": {"command": "echo 'cmd2'"},
+                        },
+                    },
+                    {
+                        "id": "c3",
+                        "function": {
+                            "name": "execute_command",
+                            "arguments": {"command": "touch cmd3_should_not_run.txt"},
+                        },
+                    },
+                ],
+                telemetry={"eval_count": 10, "prompt_eval_count": 10},
+            )
+
+        rec_budget = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=2,
+            max_wall=60,
+            run_dir=os.path.join(tmp, "budget_test"),
+            actuator="native_tools",
+            verbose=False,
+            chat_fn=mock_budget_overflow,
+        )
+        if rec_budget["commands_executed"] != 2:
+            failures.append(
+                (
+                    "tool_fairness",
+                    f"expected 2 commands, got {rec_budget['commands_executed']}",
+                    str(rec_budget),
+                )
+            )
+        if os.path.exists(
+            os.path.join(tmp, "budget_test", "work", "cmd3_should_not_run.txt")
+        ):
+            failures.append(
+                (
+                    "tool_fairness",
+                    "command exceeding max_commands budget was executed!",
+                    "",
+                )
+            )
+
+        # 3. Reject mixed finish_task batch
+        def mock_mixed_finish(*args: Any, **kwargs: Any) -> StreamResult:
+            return StreamResult(
+                content="",
+                thinking="",
+                tool_calls=[
+                    {
+                        "id": "c_cmd",
+                        "function": {
+                            "name": "execute_command",
+                            "arguments": {"command": "touch mixed_should_not_run.txt"},
+                        },
+                    },
+                    {
+                        "id": "c_fin",
+                        "function": {"name": "finish_task", "arguments": {}},
+                    },
+                ],
+                telemetry={"eval_count": 10, "prompt_eval_count": 10},
+            )
+
+        rec_mixed = run_task(
+            meta=meta,
+            model="mock:test",
+            ctx=2048,
+            ngpu=0,
+            max_steps=2,
+            max_wall=60,
+            run_dir=os.path.join(tmp, "mixed_finish"),
+            actuator="native_tools",
+            verbose=False,
+            chat_fn=mock_mixed_finish,
+        )
+        if rec_mixed["invalid_actions"] == 0:
+            failures.append(
+                (
+                    "tool_fairness",
+                    "batch mixing finish_task and command was not rejected",
+                    str(rec_mixed),
+                )
+            )
+        if os.path.exists(
+            os.path.join(tmp, "mixed_finish", "work", "mixed_should_not_run.txt")
+        ):
+            failures.append(
+                (
+                    "tool_fairness",
+                    "command from mixed finish_task batch was executed!",
+                    "",
+                )
+            )
+
+        # 4. Plain text in native tools mode rejection
         def mock_text_in_tools(*args: Any, **kwargs: Any) -> StreamResult:
             return StreamResult(
                 content="RUN: touch should_not_exist.txt",
@@ -727,6 +980,46 @@ def native_tool_fairness_unit_tests() -> list[tuple[str, str, str]]:
                 )
             )
 
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures
+
+
+def policy_check_symlink_tests() -> list[tuple[str, str, str]]:
+    """Verify policy_check rejects symlinks, even at allowlisted paths."""
+    failures = []
+    tmp = tempfile.mkdtemp(prefix="bench-symlink-policy-")
+    try:
+        run_dir = os.path.join(tmp, "run")
+        work_dir = os.path.join(run_dir, "work")
+        os.makedirs(work_dir)
+
+        # Initial baseline snapshot with allowlisted file
+        baseline_file = os.path.join(work_dir, "app.py")
+        with open(baseline_file, "w") as f:
+            f.write("# original app\n")
+
+        with open(os.path.join(run_dir, "baseline.json"), "w") as f:
+            json.dump(snapshot(work_dir), f)
+
+        # Replace allowlisted file with a symlink
+        target_file = os.path.join(tmp, "secret.txt")
+        with open(target_file, "w") as f:
+            f.write("SECRET")
+
+        os.remove(baseline_file)
+        os.symlink(target_file, baseline_file)
+
+        meta = {"allowed_files": ["app.py"]}
+        diff = policy_check(meta, work_dir, run_dir)
+        if "app.py" not in diff["forbidden"]:
+            failures.append(
+                (
+                    "policy_check",
+                    "symlink at allowlisted path 'app.py' was not flagged as forbidden",
+                    str(diff),
+                )
+            )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return failures
@@ -879,6 +1172,9 @@ def main() -> int:
     print("Running streaming parser unit tests...")
     failures.extend(streaming_parser_unit_tests())
 
+    print("Running premature stream closure tests...")
+    failures.extend(premature_stream_closure_unit_tests())
+
     print("Running classifier unit tests...")
     failures.extend(classifier_unit_tests())
 
@@ -902,6 +1198,9 @@ def main() -> int:
 
     print("Running native tool fairness tests...")
     failures.extend(native_tool_fairness_unit_tests())
+
+    print("Running symlink policy check tests...")
+    failures.extend(policy_check_symlink_tests())
 
     print("Running sandbox regression checks...")
     failures.extend(sandbox_regression_checks())
