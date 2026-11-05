@@ -1443,11 +1443,15 @@ def main() -> int:
     total_h = sum(r["total_wall_s"] for r in recs) / 3600 or 1e-9
     agent_h = sum(r["agent_wall_s"] for r in recs) / 3600 or 1e-9
     verify_h = sum(r["verification_wall_s"] for r in recs) / 3600 or 1e-9
+    vram_vals = [
+        int(r["peak_vram_mib"]) for r in recs if r.get("peak_vram_mib") is not None
+    ]
+    peak_vram_str = f"{max(vram_vals)} MiB" if vram_vals else "n/a"
     print(
         f"\n{n} runs  pass={ok}/{n} ({100 * ok / n:.0f}%)  "
         f"verified tasks/hour={ok / total_h:.2f}  "
         f"(agent: {agent_h * 3600:.1f}s, verify: {verify_h * 3600:.1f}s)  "
-        f"peak_vram={max((r.get('peak_vram_mib', 0) for r in recs), default=0)} MiB  "
+        f"peak_vram={peak_vram_str}  "
         f"invalid_actions={sum(r.get('invalid_actions', 0) for r in recs)}"
     )
     return 0 if ok == n else 1
