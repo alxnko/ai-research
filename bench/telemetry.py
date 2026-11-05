@@ -22,6 +22,12 @@ except Exception:
     HAS_PYNVML = False
     pynvml = None
 
+try:
+    _ctx_fs = mp.get_context("forkserver")
+    _ctx_fs.set_forkserver_preload(["urllib.request", "json", "bench.telemetry"])
+except (ValueError, AttributeError):
+    pass
+
 SAMPLING_VERSION = "v1"
 
 BENCH_TOOLS = [
@@ -176,6 +182,7 @@ def build_telemetry_record(
         "load_duration_s": round(state.get("load_duration_ns", 0) / 1e9, 4),
         "transport_wall_s": round(wall_duration_s, 4),
         "incomplete_stream": not done,
+        "tokens_incomplete": not done,
         "done_reason": done_reason,
         "content_length_chars": len(state.get("content", "")),
         "thinking_length_chars": len(state.get("thinking", "")),
@@ -272,15 +279,28 @@ def chat_stream(
     t0 = time.perf_counter()
     deadline = time.monotonic() + max(0.001, float(timeout))
 
-    ctx_mp = mp.get_context("fork")
-    parent_conn, child_conn = ctx_mp.Pipe(duplex=False)
+    try:
+        ctx_mp = mp.get_context("forkserver")
+    except ValueError:
+        ctx_mp = mp.get_context("spawn")
 
-    proc = ctx_mp.Process(
-        target=_inference_worker,
-        args=(child_conn, url, body, float(timeout)),
-    )
-    proc.start()
-    child_conn.close()
+    parent_conn, child_conn = ctx_mp.Pipe(duplex=False)
+    proc: Any = None
+    try:
+        proc = ctx_mp.Process(
+            target=_inference_worker,
+            args=(child_conn, url, body, float(timeout)),
+        )
+        proc.start()
+    except Exception:
+        parent_conn.close()
+        child_conn.close()
+        raise
+    finally:
+        try:
+            child_conn.close()
+        except Exception:
+            pass
 
     timed_out_deadline = False
     worker_error: str | None = None
@@ -301,8 +321,12 @@ def chat_stream(
                     break
 
                 if event_type == "chunk":
-                    chunk = json.loads(payload)
-                    parse_stream_chunk_event(chunk, t0, state)
+                    try:
+                        chunk = json.loads(payload)
+                        parse_stream_chunk_event(chunk, t0, state)
+                    except Exception as e:
+                        worker_error = f"Malformed stream chunk: {e}"
+                        break
                 elif event_type == "done":
                     break
                 elif event_type == "error":
@@ -314,22 +338,26 @@ def chat_stream(
                         try:
                             event_type, payload = parent_conn.recv()
                             if event_type == "chunk":
-                                chunk = json.loads(payload)
-                                parse_stream_chunk_event(chunk, t0, state)
+                                try:
+                                    chunk = json.loads(payload)
+                                    parse_stream_chunk_event(chunk, t0, state)
+                                except Exception as e:
+                                    worker_error = f"Malformed stream chunk: {e}"
                             elif event_type == "error":
                                 worker_error = payload
                         except (EOFError, BrokenPipeError):
                             pass
                     break
     finally:
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=0.5)
+        if proc is not None:
             if proc.is_alive():
-                proc.kill()
+                proc.terminate()
                 proc.join(timeout=0.5)
-        else:
-            proc.join(timeout=0.1)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=0.5)
+            else:
+                proc.join(timeout=0.1)
         parent_conn.close()
 
     t_end = time.perf_counter()

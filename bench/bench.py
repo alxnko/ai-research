@@ -824,7 +824,9 @@ def run_task(
     vram_mon = VramMonitor(interval_s=0.5)
     vram_mon.start()
 
-    t0 = time.time()
+    t_start_wall = time.time()
+    mono_t0 = time.monotonic()
+    agent_deadline = mono_t0 + max_wall
     steps = 0
     model_turns = 0
     commands_executed = 0
@@ -840,7 +842,7 @@ def run_task(
 
     try:
         while model_turns < max_steps:
-            rem = max_wall - (time.time() - t0)
+            rem = agent_deadline - time.monotonic()
             if rem <= 0:
                 timed_out = True
                 break
@@ -1024,7 +1026,7 @@ def run_task(
                 batch_timed_out = False
                 for call_idx, call in enumerate(tool_calls_list):
                     # Check remaining wall-clock budget before each command in batch
-                    rem_cmd = max_wall - (time.time() - t0)
+                    rem_cmd = agent_deadline - time.monotonic()
                     if rem_cmd <= 0:
                         timed_out = True
                         batch_timed_out = True
@@ -1165,7 +1167,7 @@ def run_task(
             kind, cmd = parse_action(reply)
             active_telemetry = res.telemetry
             if kind is None and thinking and not reply.strip():
-                rem_retry = max_wall - (time.time() - t0)
+                rem_retry = agent_deadline - time.monotonic()
                 if rem_retry <= 0:
                     timed_out = True
                     break
@@ -1264,7 +1266,7 @@ def run_task(
                 continue
 
             tool_calls += 1
-            rem_cmd = max_wall - (time.time() - t0)
+            rem_cmd = agent_deadline - time.monotonic()
             if rem_cmd <= 0:
                 timed_out = True
                 break
@@ -1304,13 +1306,13 @@ def run_task(
     finally:
         vram_data = vram_mon.stop()
 
-    t_agent_end = time.time()
-    agent_wall_s = t_agent_end - t0
-    t_verify_start = time.time()
+    mono_agent_end = time.monotonic()
+    agent_wall_s = mono_agent_end - mono_t0
+    mono_verify_start = time.monotonic()
     tests_ok, test_out = score(meta, work, run_dir, strict_isolation=strict_isolation)
     diff = policy_check(meta, work, run_dir)
-    verification_wall_s = time.time() - t_verify_start
-    total_wall_s = time.time() - t0
+    verification_wall_s = time.monotonic() - mono_verify_start
+    total_wall_s = time.monotonic() - mono_t0
 
     verification_passed = bool(tests_ok and not diff["forbidden"])
     run_successful = bool(verification_passed and not inference_error and not timed_out)
@@ -1334,16 +1336,23 @@ def run_task(
         inference_error=inference_error,
     )
 
+    tokens_incomplete = any(
+        bool(r.get("incomplete_stream") or r.get("tokens_incomplete"))
+        for r in telemetry_records
+    )
+
     with open(os.path.join(run_dir, "transcript.json"), "w") as f:
         json.dump(
             {
                 "task": meta["id"],
                 "task_digest": digest,
+                "timestamp_start": t_start_wall,
                 "actuator": actuator,
                 "sampling": sampling.to_dict(),
                 "verification_passed": verification_passed,
                 "run_successful": run_successful,
                 "inference_error": inference_error,
+                "tokens_incomplete": tokens_incomplete,
                 "steps": transcript,
                 "inference_telemetry": telemetry_records,
                 "classification": classification,
@@ -1357,6 +1366,7 @@ def run_task(
     rec = {
         "task": meta["id"],
         "task_digest": digest,
+        "timestamp_start": t_start_wall,
         "passed": run_successful,
         "run_successful": run_successful,
         "verification_passed": verification_passed,
@@ -1373,6 +1383,7 @@ def run_task(
         "commands_executed": commands_executed,
         "max_commands": max_commands,
         "tokens": tokens,
+        "tokens_incomplete": tokens_incomplete,
         "agent_wall_s": round(agent_wall_s, 2),
         "verification_wall_s": round(verification_wall_s, 2),
         "total_wall_s": round(total_wall_s, 2),
