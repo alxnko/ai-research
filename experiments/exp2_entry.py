@@ -39,12 +39,56 @@ def main() -> int:
     parser.add_argument("--run-dir", required=True)
     args, bench_args = parser.parse_known_args()
 
-    if not any(x == "--actuator" or x.startswith("--actuator=") for x in bench_args):
-        raise SystemExit("EXP-2 requires --actuator native_tools")
-    if not any(x == "--task" or x.startswith("--task=") for x in bench_args):
-        raise SystemExit("EXP-2 requires one explicit --task per run")
-    if not any(x == "--strict-isolation" for x in bench_args):
-        raise SystemExit("EXP-2 requires --strict-isolation")
+    # Fail closed on accidental configuration drift between paired arms.
+    checks = argparse.ArgumentParser(add_help=False)
+    checks.add_argument("--model")
+    checks.add_argument("--actuator")
+    checks.add_argument("--task")
+    checks.add_argument("--ctx", type=int)
+    checks.add_argument("--ngpu", type=int)
+    checks.add_argument("--steps", type=int)
+    checks.add_argument("--max-wall", type=int)
+    checks.add_argument("--strict-isolation", action="store_true")
+    checks.add_argument("--temperature", type=float)
+    checks.add_argument("--top-p", type=float)
+    checks.add_argument("--top-k", type=int)
+    checks.add_argument("--repeat-penalty", type=float)
+    checks.add_argument("--seed", type=int)
+    checks.add_argument("--sampling-profile")
+    parsed, unknown = checks.parse_known_args(bench_args)
+    expected = {
+        "model": "qwen3.5:4b-q4_K_M",
+        "actuator": "native_tools",
+        "ctx": 16384,
+        "ngpu": 99,
+        "steps": 20,
+        "max_wall": 600,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "repeat_penalty": 1.0,
+        "sampling_profile": "exp2-coding-v1",
+        "strict_isolation": True,
+    }
+    for key, value in expected.items():
+        if getattr(parsed, key) != value:
+            raise SystemExit(f"EXP-2 configuration mismatch: {key} must be {value!r}")
+    allowed_tasks = {
+        "backend-auth-token", "backend-idempotency",
+        "debugging-off-by-one", "debugging-money-round",
+        "refactor-parser", "refactor-validators",
+    }
+    if parsed.task not in allowed_tasks or parsed.seed not in {42, 43, 44}:
+        raise SystemExit("EXP-2 requires one preregistered task and seed 42/43/44")
+    if unknown:
+        raise SystemExit(f"Unregistered benchmark arguments: {unknown!r}")
+
+    expected_dir = os.path.join(
+        benchmark.ROOT, "runs", "exp2", args.exp2_policy,
+        f"seed{parsed.seed}", parsed.task,
+    )
+    if os.path.abspath(args.run_dir) != expected_dir:
+        raise SystemExit(f"EXP-2 output must be {expected_dir}")
 
     prompt = BASE_PROMPT if args.exp2_policy == "control" else VERIFY_PROMPT
     digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
