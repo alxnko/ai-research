@@ -485,7 +485,7 @@ class _MockStreamHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                     i += 1
                     time.sleep(0.01)
-            except (BrokenPipeError, ConnectionResetError, OSError):
+            except BrokenPipeError, ConnectionResetError, OSError:
                 pass
         elif mode == "stall_after_initial":
             chunk = {"message": {"content": "initial data "}, "done": False}
@@ -498,7 +498,7 @@ class _MockStreamHandler(http.server.BaseHTTPRequestHandler):
                 chunk = {"message": {"content": "too late"}, "done": True}
                 self.wfile.write((json.dumps(chunk) + "\n").encode())
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
+            except BrokenPipeError, ConnectionResetError, OSError:
                 pass
         elif mode == "incomplete_tool":
             chunk = {
@@ -535,12 +535,12 @@ class _MockStreamHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write((json.dumps(chunk2) + "\n").encode())
             self.wfile.flush()
 
-    def log_message(self, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
 
 def inference_deadline_regression_tests() -> list[tuple[str, str, str]]:
-    """Test cancellable worker, monotonic deadline enforcement, and absence of lingering activity."""
+    """Test cancellable worker, monotonic deadline, and no lingering activity."""
     failures: list[tuple[str, str, str]] = []
     server = _MockStreamServer(("127.0.0.1", 0), _MockStreamHandler)
     port = server.server_address[1]
@@ -552,42 +552,110 @@ def inference_deadline_regression_tests() -> list[tuple[str, str, str]]:
         # 1. Continuous token streaming beyond deadline
         server.mode = "infinite_stream"
         t0 = time.monotonic()
-        res1 = chat_stream("mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url)
+        res1 = chat_stream(
+            "mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url
+        )
         dur1 = time.monotonic() - t0
         if not res1.telemetry.get("timed_out"):
-            failures.append(("inference_deadline", "infinite stream: timed_out not True", str(res1.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "infinite stream: timed_out not True",
+                    str(res1.telemetry),
+                )
+            )
         if res1.telemetry.get("done_reason") != "deadline_exceeded":
-            failures.append(("inference_deadline", "infinite stream: done_reason != deadline_exceeded", str(res1.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "infinite stream: done_reason != deadline_exceeded",
+                    str(res1.telemetry),
+                )
+            )
         if not res1.telemetry.get("tokens_incomplete"):
-            failures.append(("inference_deadline", "infinite stream: tokens_incomplete not True", str(res1.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "infinite stream: tokens_incomplete not True",
+                    str(res1.telemetry),
+                )
+            )
         if not res1.content:
-            failures.append(("inference_deadline", "infinite stream: partial content not recorded", str(res1)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "infinite stream: partial content not recorded",
+                    str(res1),
+                )
+            )
         if dur1 > 0.75:
-            failures.append(("inference_deadline", "infinite stream: deadline not enforced in time", f"dur={dur1}s"))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "infinite stream: deadline not enforced in time",
+                    f"dur={dur1}s",
+                )
+            )
 
         # 2. Connection that stops sending data after initial output
         server.mode = "stall_after_initial"
         t0 = time.monotonic()
-        res2 = chat_stream("mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url)
+        res2 = chat_stream(
+            "mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url
+        )
         dur2 = time.monotonic() - t0
         if not res2.telemetry.get("timed_out"):
-            failures.append(("inference_deadline", "stall after initial: timed_out not True", str(res2.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "stall after initial: timed_out not True",
+                    str(res2.telemetry),
+                )
+            )
         if not res2.telemetry.get("tokens_incomplete"):
-            failures.append(("inference_deadline", "stall after initial: tokens_incomplete not True", str(res2.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "stall after initial: tokens_incomplete not True",
+                    str(res2.telemetry),
+                )
+            )
         if res2.content != "initial data ":
-            failures.append(("inference_deadline", "stall after initial: initial content missing", res2.content))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "stall after initial: initial content missing",
+                    res2.content,
+                )
+            )
         if dur2 > 0.75:
-            failures.append(("inference_deadline", "stall after initial: took too long", f"dur={dur2}s"))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "stall after initial: took too long",
+                    f"dur={dur2}s",
+                )
+            )
 
         # 3. Server that delays its first response
         server.mode = "delay_first"
         t0 = time.monotonic()
-        res3 = chat_stream("mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url)
+        res3 = chat_stream(
+            "mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=0.25, url=url
+        )
         dur3 = time.monotonic() - t0
         if not res3.telemetry.get("timed_out"):
-            failures.append(("inference_deadline", "delayed first: timed_out not True", str(res3.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "delayed first: timed_out not True",
+                    str(res3.telemetry),
+                )
+            )
         if dur3 > 0.75:
-            failures.append(("inference_deadline", "delayed first: took too long", f"dur={dur3}s"))
+            failures.append(
+                ("inference_deadline", "delayed first: took too long", f"dur={dur3}s")
+            )
 
         # 4. Incomplete tool call at deadline: ensures no command is executed
         server.mode = "incomplete_tool"
@@ -611,31 +679,78 @@ def inference_deadline_regression_tests() -> list[tuple[str, str, str]]:
                 verbose=False,
                 chat_fn=custom_chat_fn,
             )
-            created_file = os.path.join(tmp, "tool_timeout_run", "work", "should_never_exist_timeout.txt")
+            created_file = os.path.join(
+                tmp, "tool_timeout_run", "work", "should_never_exist_timeout.txt"
+            )
             if os.path.exists(created_file):
-                failures.append(("inference_deadline", "incomplete tool call was executed!", ""))
+                failures.append(
+                    ("inference_deadline", "incomplete tool call was executed!", "")
+                )
             if run_res.get("outcome") != "timeout":
-                failures.append(("inference_deadline", f"expected outcome 'timeout', got {run_res.get('outcome')}", str(run_res)))
+                failures.append(
+                    (
+                        "inference_deadline",
+                        f"expected outcome 'timeout', got {run_res.get('outcome')}",
+                        str(run_res),
+                    )
+                )
             if not run_res.get("symptoms", {}).get("timeout_exceeded"):
-                failures.append(("inference_deadline", "symptom timeout_exceeded not True", str(run_res)))
+                failures.append(
+                    (
+                        "inference_deadline",
+                        "symptom timeout_exceeded not True",
+                        str(run_res),
+                    )
+                )
             if not run_res.get("tokens_incomplete"):
-                failures.append(("inference_deadline", "run_res tokens_incomplete not True", str(run_res)))
+                failures.append(
+                    (
+                        "inference_deadline",
+                        "run_res tokens_incomplete not True",
+                        str(run_res),
+                    )
+                )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
         # 5. Normal requests finishing before the deadline
         server.mode = "normal"
-        t0 = time.monotonic()
-        res5 = chat_stream("mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=2.0, url=url)
-        dur5 = time.monotonic() - t0
+        res5 = chat_stream(
+            "mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=2.0, url=url
+        )
         if res5.telemetry.get("incomplete_stream"):
-            failures.append(("inference_deadline", "normal request: incomplete_stream was True", str(res5.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "normal request: incomplete_stream was True",
+                    str(res5.telemetry),
+                )
+            )
         if res5.telemetry.get("tokens_incomplete"):
-            failures.append(("inference_deadline", "normal request: tokens_incomplete was True", str(res5.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "normal request: tokens_incomplete was True",
+                    str(res5.telemetry),
+                )
+            )
         if res5.telemetry.get("done_reason") != "stop":
-            failures.append(("inference_deadline", f"normal request: done_reason != stop ({res5.telemetry.get('done_reason')})", str(res5.telemetry)))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "normal request: done_reason != stop "
+                    f"({res5.telemetry.get('done_reason')})",
+                    str(res5.telemetry),
+                )
+            )
         if res5.content != "Hello world":
-            failures.append(("inference_deadline", f"normal request: content mismatch ({res5.content})", ""))
+            failures.append(
+                (
+                    "inference_deadline",
+                    f"normal request: content mismatch ({res5.content})",
+                    "",
+                )
+            )
 
         # 6. Cleanup of cancelled request and absence of lingering inference activity
         active_children = mp.active_children()
@@ -644,16 +759,42 @@ def inference_deadline_regression_tests() -> list[tuple[str, str, str]]:
         except ValueError:
             fs_children = []
         if active_children or fs_children:
-            failures.append(("inference_deadline", f"lingering worker child processes found: mp={active_children} fs={fs_children}", ""))
+            failures.append(
+                (
+                    "inference_deadline",
+                    "lingering worker child processes found: "
+                    f"mp={active_children} fs={fs_children}",
+                    "",
+                )
+            )
 
         # 7. Malformed chunk handling and cleanup
         server.mode = "malformed_chunk"
         try:
-            chat_stream("mock", [{"role": "user", "content": "hi"}], 2048, 0, timeout=1.0, url=url)
-            failures.append(("inference_deadline", "malformed chunk: did not raise RuntimeError", ""))
+            chat_stream(
+                "mock",
+                [{"role": "user", "content": "hi"}],
+                2048,
+                0,
+                timeout=1.0,
+                url=url,
+            )
+            failures.append(
+                (
+                    "inference_deadline",
+                    "malformed chunk: did not raise RuntimeError",
+                    "",
+                )
+            )
         except RuntimeError as e:
             if "Malformed stream chunk" not in str(e):
-                failures.append(("inference_deadline", f"malformed chunk: unexpected error message: {e}", ""))
+                failures.append(
+                    (
+                        "inference_deadline",
+                        f"malformed chunk: unexpected error message: {e}",
+                        "",
+                    )
+                )
     finally:
         server.shutdown()
         server.server_close()
