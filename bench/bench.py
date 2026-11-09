@@ -52,7 +52,7 @@ Rules:
 - You have at most {max_steps} steps. Be concise.
 """
 
-SYSTEM_PROMPT_TOOLS = """
+SYSTEM_PROMPT_TOOLS: str = """
 You are an agentic software engineer fixing a codebase in a sandbox.
 Use the execute_command tool to run bash commands in the workspace.
 When all edits and testing are complete, call finish_task to submit the solution.
@@ -675,7 +675,7 @@ def _mock_chat_stream(
     ngpu: int,
     sampling: SamplingConfig | None = None,
     tools: list[dict[str, Any]] | None = None,
-    timeout: int = 1800,
+    timeout: float = 1800.0,
     url: str = "http://127.0.0.1:11434/api/chat",
     step: int = 0,
     request_idx: int = 1,
@@ -773,7 +773,7 @@ def run_task(
     ctx: int,
     ngpu: int,
     max_steps: int,
-    max_wall: int,
+    max_wall: float,
     run_dir: str,
     sampling: SamplingConfig | None = None,
     actuator: str = "text",
@@ -787,9 +787,11 @@ def run_task(
     - `max_wall` (seconds) strictly bounds AGENT EXECUTION alone (`agent_wall_s`).
       The agent loop terminates immediately if elapsed agent time exceeds max_wall.
       Any in-flight inference requests are hard-cancelled at the monotonic deadline.
-    - Final scoring (hidden-test verification) runs post-agent in an isolated workspace
-      and is governed separately by the task's `test_timeout_s` / `timeout_s` (default: 120s).
-    - `total_wall_s` captures end-to-end wall time: `agent_wall_s + verification_wall_s`.
+    - Final scoring (hidden-test verification) runs post-agent in an isolated
+      workspace and is governed separately by the task's `test_timeout_s` /
+      `timeout_s` (default: 120s).
+    - `total_wall_s` captures end-to-end wall time:
+      `agent_wall_s + verification_wall_s`.
     """
     os.makedirs(run_dir, exist_ok=True)
     work = prepare(meta, run_dir)
@@ -1220,7 +1222,8 @@ def run_task(
                         break
                     else:
                         inference_error = (
-                            "Inference stream closed prematurely without done event (retry)"
+                            "Inference stream closed prematurely without done "
+                            "event (retry)"
                         )
                         step_entry = {
                             "step": steps,
@@ -1485,35 +1488,64 @@ def environment() -> dict[str, Any]:
     }
 
 
-def model_fingerprint(model: str) -> dict[str, Any]:
-    """Full manifest fingerprint: config digest, weights digest, and size."""
+def _manifest_doc(model: str) -> dict[str, Any] | None:
+    """Resolve a model tag to its per-platform manifest, across both layouts.
+
+    Ollama 0.40 stores tags in `manifests-v2/<registry>/<name>/<tag>` as a
+    manifest *list* whose entries point at manifest blobs in `blobs/`.
+    Older installs keep a single manifest under `manifests/`. Reading only the
+    old layout silently degrades the fingerprint to a 12-char list ID.
+    """
     name, _, tag = model.partition(":")
     tag = tag or "latest"
-    root = os.path.expanduser("~/.ollama/models/manifests")
+    models_dir = os.path.expanduser("~/.ollama/models")
     want = os.sep + os.path.join(*name.split("/"))
-    for dirpath, _, files in os.walk(root):
-        if dirpath.endswith(want) and tag in files:
+    for layout in ("manifests-v2", "manifests"):
+        root = os.path.join(models_dir, layout)
+        for dirpath, _, files in os.walk(root):
+            if not (dirpath.endswith(want) and tag in files):
+                continue
             try:
                 with open(os.path.join(dirpath, tag)) as f:
                     data = json.load(f)
-                config_d = data.get("config", {}).get("digest")
-                model_layer = next(
-                    (
-                        layer
-                        for layer in data.get("layers", [])
-                        if "model" in layer.get("mediaType", "")
-                    ),
-                    {},
+            except OSError, ValueError:
+                continue
+            refs = data.get("manifests") or []
+            if not refs:
+                return data
+            for ref in refs:
+                blob = os.path.join(
+                    models_dir, "blobs", str(ref.get("digest", "")).replace(":", "-")
                 )
-                return {
-                    "config_digest": config_d,
-                    "weights_digest": model_layer.get("digest"),
-                    "weights_bytes": model_layer.get("size"),
-                }
-            except Exception:
-                break
+                try:
+                    with open(blob) as f:
+                        return {**json.load(f), "manifest_digest": ref["digest"]}
+                except OSError, ValueError:
+                    continue
+    return None
+
+
+def model_fingerprint(model: str) -> dict[str, Any]:
+    """Full manifest fingerprint: manifest, config and weights digests."""
+    data = _manifest_doc(model)
+    if data is not None:
+        model_layer = next(
+            (
+                layer
+                for layer in data.get("layers", [])
+                if "model" in layer.get("mediaType", "")
+            ),
+            {},
+        )
+        return {
+            "manifest_digest": data.get("manifest_digest"),
+            "config_digest": data.get("config", {}).get("digest"),
+            "weights_digest": model_layer.get("digest"),
+            "weights_bytes": model_layer.get("size"),
+        }
     listed = _sh(f"ollama list | awk '$1==\"{model}\"{{print $2}}'")
     return {
+        "manifest_digest": None,
         "config_digest": listed + " (abbreviated)",
         "weights_digest": None,
         "weights_bytes": None,

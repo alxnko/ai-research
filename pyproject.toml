@@ -28,11 +28,12 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # sys.path setup must run before the local imports.
-"bench/selfcheck.py" = ["E402"]
+# Test orchestration is a long, linear script of independent checks.
+"bench/selfcheck.py" = ["E402", "PLR0912", "PLR0915"]
 # The agent loop and the model call take the run configuration explicitly:
 # bundling it into a config object would hide, not reduce, what they depend on.
 "bench/bench.py" = ["E402", "PLR0913", "PLR0917", "PLR0915", "PLR0912"]
-"bench/telemetry.py" = ["PLR0913", "PLR0917"]
+"bench/telemetry.py" = ["PLR0913", "PLR0917", "PLR0912", "PLR0915"]
 "bench/classifier.py" = ["PLR0913", "PLR0917", "PLR0912"]
 
 [tool.ty.environment]

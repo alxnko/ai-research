@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import multiprocessing as mp
 import subprocess
@@ -25,7 +26,7 @@ except Exception:
 try:
     _ctx_fs = mp.get_context("forkserver")
     _ctx_fs.set_forkserver_preload(["urllib.request", "json", "bench.telemetry"])
-except (ValueError, AttributeError):
+except ValueError, AttributeError:
     pass
 
 SAMPLING_VERSION = "v1"
@@ -211,15 +212,11 @@ def _inference_worker(
                 pipe_conn.send(("chunk", line_str))
         pipe_conn.send(("done", None))
     except Exception as e:
-        try:
+        with contextlib.suppress(BrokenPipeError, EOFError):
             pipe_conn.send(("error", str(e)))
-        except (BrokenPipeError, EOFError):
-            pass
     finally:
-        try:
+        with contextlib.suppress(Exception):
             pipe_conn.close()
-        except Exception:
-            pass
 
 
 def chat_stream(
@@ -234,7 +231,7 @@ def chat_stream(
     step: int = 0,
     request_idx: int = 1,
 ) -> StreamResult:
-    """Stream from Ollama /api/chat with per-request TTFT, token accounting, and hard deadline cancellation."""
+    """Stream from Ollama /api/chat with TTFT, token accounting, and a hard deadline."""
     if sampling is None:
         sampling = SamplingConfig()
 
@@ -297,10 +294,8 @@ def chat_stream(
         child_conn.close()
         raise
     finally:
-        try:
+        with contextlib.suppress(Exception):
             child_conn.close()
-        except Exception:
-            pass
 
     timed_out_deadline = False
     worker_error: str | None = None
@@ -317,7 +312,7 @@ def chat_stream(
             if parent_conn.poll(wait_s):
                 try:
                     event_type, payload = parent_conn.recv()
-                except (EOFError, BrokenPipeError):
+                except EOFError, BrokenPipeError:
                     break
 
                 if event_type == "chunk":
@@ -332,22 +327,21 @@ def chat_stream(
                 elif event_type == "error":
                     worker_error = payload
                     break
-            else:
-                if not proc.is_alive():
-                    if parent_conn.poll(0):
-                        try:
-                            event_type, payload = parent_conn.recv()
-                            if event_type == "chunk":
-                                try:
-                                    chunk = json.loads(payload)
-                                    parse_stream_chunk_event(chunk, t0, state)
-                                except Exception as e:
-                                    worker_error = f"Malformed stream chunk: {e}"
-                            elif event_type == "error":
-                                worker_error = payload
-                        except (EOFError, BrokenPipeError):
-                            pass
-                    break
+            elif not proc.is_alive():
+                if parent_conn.poll(0):
+                    try:
+                        event_type, payload = parent_conn.recv()
+                        if event_type == "chunk":
+                            try:
+                                chunk = json.loads(payload)
+                                parse_stream_chunk_event(chunk, t0, state)
+                            except Exception as e:
+                                worker_error = f"Malformed stream chunk: {e}"
+                        elif event_type == "error":
+                            worker_error = payload
+                    except EOFError, BrokenPipeError:
+                        pass
+                break
     finally:
         if proc is not None:
             if proc.is_alive():
