@@ -1,0 +1,5 @@
+# SC2164 (cd without || exit): experiments/run_exp2.sh is the frozen EXP-2
+# runner and must not be edited. It uses `set -uo pipefail` without -e, so a
+# failed `cd` there would not abort. Revisit when the experiment controller
+# replaces it; do not widen this exclusion.
+disable=SC2164
