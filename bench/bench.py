@@ -32,6 +32,7 @@ from bench.telemetry import (
 )
 
 TASKS = os.path.join(ROOT, "bench", "tasks")
+SUITES = os.path.join(ROOT, "bench", "suites")
 RUNS = os.path.join(ROOT, "runs")
 
 SYSTEM_PROMPT_TEXT = """
@@ -569,6 +570,21 @@ def all_tasks() -> list[str]:
         if os.path.isdir(p) and os.path.exists(os.path.join(p, "meta.json")):
             ids.append(name)
     return ids
+
+
+def available_suites() -> list[str]:
+    if not os.path.isdir(SUITES):
+        return []
+    return sorted(n[:-5] for n in os.listdir(SUITES) if n.endswith(".json"))
+
+
+def load_suite(name: str) -> dict[str, Any]:
+    """A suite pins an exact task set and each task's fixture digest."""
+    path = os.path.join(SUITES, f"{name}.json")
+    if name not in available_suites():
+        raise ValueError(f"unknown suite {name!r}; available: {available_suites()}")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def prepare(meta: dict[str, Any], run_dir: str) -> str:
@@ -1634,6 +1650,20 @@ def _resolve_run_dir_and_config(
     return run_dir, cfg, sampling
 
 
+def _selected_task_ids(args: argparse.Namespace) -> list[str]:
+    """Exactly one of --task / --suite; never "everything on disk"."""
+    if args.task and args.suite:
+        raise ValueError("use --task or --suite, not both.")
+    if args.suite:
+        return list(load_suite(args.suite)["tasks"])
+    if args.task:
+        return [args.task]
+    raise ValueError(
+        "specify --task <id> or --suite <name> "
+        f"(available suites: {', '.join(available_suites()) or 'none'})."
+    )
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="qwen2.5-coder:7b")
@@ -1642,6 +1672,12 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--task", help="run a single task by ID")
+    p.add_argument(
+        "--suite",
+        help="run every task of a named suite (bench/suites/<name>.json); "
+        "required when --task is not given, so legacy and corrected task "
+        "versions are never evaluated together by accident",
+    )
     p.add_argument("--tag", help="label for the run output directory")
     p.add_argument(
         "--max-wall",
@@ -1670,6 +1706,14 @@ def main() -> int:
     p.add_argument("--run-dir", help="custom destination directory for this run")
     args = p.parse_args()
 
+    ids: list[str] = []
+    if not args.resume:  # fail before creating a run directory
+        try:
+            ids = _selected_task_ids(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
     run_dir, cfg, sampling = _resolve_run_dir_and_config(args, p)
 
     if cfg.get("strict_isolation") and not check_cgroup_v2():
@@ -1680,7 +1724,11 @@ def main() -> int:
         )
         return 1
 
-    ids = [args.task] if args.task else all_tasks()
+    try:
+        ids = ids or _selected_task_ids(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if not ids:
         print("no tasks found", file=sys.stderr)
         return 1

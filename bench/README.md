@@ -51,16 +51,42 @@ Benchmarking supports reproducible sampling configurations:
 
 ## Tasks
 
-24 hand-written tasks in `tasks/`, each with:
+26 task directories in `tasks/`, grouped into suites (below). Each has:
 
 - `repo/` — starting repository, stub or buggy code
 - `tests/` — hidden tests, copied only into clean scoring workspace as `_hidden/`
 - `solution/` — golden solution, used by `selfcheck.py`
 - `meta.json` — category, prompt, test command, timeouts, allowed files
+- `mutants/` (optional) — known-wrong implementations that the hidden tests must
+  reject; `selfcheck.py` fails if one passes, which keeps the oracle honest
 
 Categories: backend, debugging, devops, frontend, mobile, refactoring.
 Tasks are independent, offline, and use only standard library / hermetic tools.
 Each task run records a SHA256 `task_digest` fingerprinting task fixtures for reproducibility.
+
+## Suites
+
+A suite (`suites/<name>.json`) pins an exact task set and each task's fixture
+digest. `selfcheck.py` fails if a suite's fixture changes, so a frozen suite
+cannot drift silently.
+
+| Suite | Tasks | Notes |
+| --- | --- | --- |
+| `v0.4` | the 24 original tasks | Frozen, byte-identical to tag `v0.4`. EXP-2 used six of them. |
+| `v0.5` | v0.4 with two tasks replaced | `backend-idempotency-v2` and `debugging-money-round-v2` replace their originals. |
+
+`bench.py` requires `--task` or `--suite`; it never runs "everything on disk",
+so legacy and corrected task versions cannot be evaluated together by accident.
+Do not mix suites inside one comparison. Scores from `v0.4` and `v0.5` are not
+directly comparable for the two replaced tasks.
+
+Why the two `-v2` tasks exist: the original `backend-idempotency` reference
+solution shared in-flight state across stores (so one store's caller could wait
+on another store's call and then fail), and `debugging-money-round` only
+checked its "no floats" rule by searching the source for the text `/ 100`. The
+v2 tasks state the per-store contract, test it deterministically, and check
+money behaviour against an independent exact-arithmetic oracle (including
+amounts beyond 2**53 where float shortcuts fail).
 
 ## Sandbox & Isolation
 
@@ -76,8 +102,8 @@ a private `/tmp`, the worktree bound at `/mnt/work`, and `--unshare-net`.
 ## Usage
 
 ```bash
-# Run all benchmark tasks
-uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99
+# Run a whole suite (a --task or --suite is always required)
+uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --suite v0.5
 
 # Run single task with deterministic sampling and streaming telemetry
 uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --task debugging-default-arg

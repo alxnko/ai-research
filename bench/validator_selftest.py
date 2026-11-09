@@ -29,7 +29,18 @@ from typing import Any
 from unittest import mock
 
 from bench import bench as bench_mod
-from bench.bench import install_tests, load_task, policy_check, run_sandboxed
+from bench.bench import (
+    all_tasks,
+    available_suites,
+    install_tests,
+    load_suite,
+    load_task,
+    policy_check,
+    prepare,
+    run_sandboxed,
+    score,
+    task_digest,
+)
 from experiments import analyze_exp2 as analyzer
 from experiments import exp2_entry as entry
 
@@ -575,6 +586,131 @@ def sandbox_escape_gates() -> list[Failure]:
     return out
 
 
+# 7. Suites and oracle strength --------------------------------------------------
+
+
+def suite_gates() -> list[Failure]:
+    """A suite pins its tasks and their fixture digests; legacy and corrected
+    task versions can never be selected together by accident."""
+    out: list[Failure] = []
+    suites = {name: load_suite(name) for name in available_suites()}
+    _expect(out, "suites", bool(suites), "no suite manifests found")
+    on_disk = set(all_tasks())
+    superseded: dict[str, str] = {}
+    for name, suite in suites.items():
+        superseded.update(suite.get("supersedes", {}))
+        for tid, digest in suite["tasks"].items():
+            _expect(out, "suites", tid in on_disk, f"{name}: {tid} not on disk")
+            _expect(
+                out,
+                "suites",
+                task_digest(tid) == digest,
+                f"{name}: fixture {tid} changed since the suite was frozen",
+            )
+    in_any = {tid for suite in suites.values() for tid in suite["tasks"]}
+    _expect(
+        out,
+        "suites",
+        on_disk <= in_any,
+        f"tasks in no suite: {sorted(on_disk - in_any)}",
+    )
+    for name, suite in suites.items():
+        tasks = set(suite["tasks"])
+        for new, old in suite.get("supersedes", {}).items():
+            _expect(out, "suites", new in tasks, f"{name}: {new} missing")
+            _expect(out, "suites", old not in tasks, f"{name}: also lists {old}")
+        for new, old in superseded.items():
+            _expect(
+                out,
+                "suites",
+                not ({new, old} <= tasks),
+                f"{name}: lists both {old} and its replacement {new}",
+            )
+        if "supersedes" not in suite:
+            _expect(
+                out,
+                "suites",
+                not (tasks & set(superseded)),
+                f"{name}: lists a corrected task id",
+            )
+
+    # the CLI refuses to guess which tasks to run (no run directory is created)
+    run_dir = tempfile.mkdtemp(prefix="selftest-suite-cli-")
+    try:
+        bench_py = os.path.join(REPO_ROOT, "bench", "bench.py")
+        for label, args, want in [
+            ("no selection", [], "specify --task"),
+            ("both selectors", ["--task", "x", "--suite", "v0.5"], "not both"),
+            ("unknown suite", ["--suite", "nope"], "unknown suite"),
+        ]:
+            proc = subprocess.run(
+                [sys.executable, bench_py, "--run-dir", f"{run_dir}/r", *args],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "BENCH_MOCK_MODEL": "1"},
+            )
+            _expect(
+                out,
+                "suites",
+                proc.returncode != 0 and want in proc.stderr,
+                f"bench.py ({label}) was not refused",
+                proc.stderr,
+            )
+            _expect(
+                out,
+                "suites",
+                not os.path.exists(f"{run_dir}/r"),
+                f"bench.py ({label}) created a run directory before refusing",
+            )
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    return out
+
+
+def _run_mutant(meta: dict[str, Any], mutant: str) -> tuple[bool, str]:
+    tmp = tempfile.mkdtemp(prefix="selftest-mutant-")
+    try:
+        work = prepare(meta, tmp)
+        target = os.listdir(meta["solution_dir"])
+        if len(target) != 1:
+            return True, "oracle mutants need a single-file solution"
+        shutil.copy2(mutant, os.path.join(work, target[0]))
+        # fail fast: one failing test proves the oracle rejects this mutant
+        return score(dict(meta, test_cmd=meta["test_cmd"] + " -f"), work, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def oracle_mutant_gates() -> list[Failure]:
+    """Known-wrong implementations in <task>/mutants/ must fail the hidden
+    tests, and for the right reason (an assertion, not a broken import)."""
+    out: list[Failure] = []
+    jobs: list[tuple[str, str, dict[str, Any]]] = []
+    for tid in all_tasks():
+        meta = load_task(tid)
+        mdir = os.path.join(meta["dir"], "mutants")
+        if not os.path.isdir(mdir):
+            continue
+        files = sorted(f for f in os.listdir(mdir) if f.endswith(".py"))
+        _expect(out, "oracle_mutants", bool(files), f"{tid}: mutants/ is empty")
+        jobs += [(tid, os.path.join(mdir, f), meta) for f in files]
+    _expect(out, "oracle_mutants", bool(jobs), "no oracle mutants found")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda j: _run_mutant(j[2], j[1]), jobs))
+    for (tid, path, _meta), (passed, text) in zip(jobs, results, strict=True):
+        name = f"{tid}/{os.path.basename(path)}"
+        _expect(
+            out, "oracle_mutants", not passed, f"{name} passes the hidden tests", text
+        )
+        broken = any(
+            marker in text
+            for marker in ("SyntaxError", "ImportError", "ModuleNotFoundError")
+        )
+        _expect(out, "oracle_mutants", not broken, f"{name} fails to load", text)
+    return out
+
+
 def validator_selftests(check_task: Callable) -> list[Failure]:
     out: list[Failure] = []
     steps: list[tuple[str, Callable[[], list[Failure]]]] = [
@@ -583,6 +719,8 @@ def validator_selftests(check_task: Callable) -> list[Failure]:
         ("model fingerprint", fingerprint_gate),
         ("missing results", result_completeness_gates),
         ("sandbox escape", sandbox_escape_gates),
+        ("suite manifests + CLI guard", suite_gates),
+        ("oracle mutants rejected", oracle_mutant_gates),
     ]
     for label, fn in steps:
         t0 = time.monotonic()

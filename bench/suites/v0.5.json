@@ -1,0 +1,34 @@
+{
+  "suite": "v0.5",
+  "description": "Corrected benchmark: v0.4 with backend-idempotency and debugging-money-round replaced by their -v2 versions. Never combine with v0.4 task ids.",
+  "tasks": {
+    "backend-auth-token": "e3b63b446c2dd2e2d29812fd30236786a6a68bd61271bcd12e7e0023ffa12300",
+    "backend-csv-import": "c7cc023c63bdaac48603a1907faeb3658907826ca1a67a87ad3ad3803af5931d",
+    "backend-idempotency-v2": "32ef1c8fc030b6d3133df4032dd96e6625e3806ca1b219a8f5f759d7689305e8",
+    "backend-pagination": "c983773cd2fa0fdccd616dd7bdcc59352b2ef067be4d158a62f65c9cf0285982",
+    "backend-rate-limit": "228b32deeead3cd48dc4a624eca96690eb1d06381c01c4308987da3337d8773f",
+    "backend-webhook-hmac": "ab1f84feff9ce2120bfd259f972a905fe7f11e9fb6c4b01d10d409c12aa16b84",
+    "debug-tz-offset": "eb0a597bf6180c2215e7160cde8f9101a5fc86f96d4983bafa2144dd06d855fe",
+    "debugging-default-arg": "7c08f5ae97c64e37ee51028dbe78182f3ffc3980b0c2e7ff1cb466ea4ddad894",
+    "debugging-money-round-v2": "3adbd5b1e910f73e37936998be4911a03747948f808a7369bf1a87194105a92b",
+    "debugging-off-by-one": "8bb19b1f0b20d7ca11fff8f71c5ea1b21a603aa489488f08b44815f00ba32d5f",
+    "debugging-unicode-sort": "0186efb28684c3fa92bff65ad3da5345853ef4162f8e327300bdc5ed237a5c6f",
+    "devops-deploy-script": "817e140560c950d651b8063d5f91c78289f9380aa3e07743b7646137c381524f",
+    "devops-healthcheck": "8df2c7fd71d6a1c42d5b5b6bc099894fa639393dc4621e956148a2274482f71c",
+    "devops-log-rotate": "e7dabb90d01d75aaf19ab3f2e4fcdd60a203d6941f1c8c524844da54bf0f86b1",
+    "frontend-query-string": "0fc5cf697055559cd1686c8c8978db29b21752ae26e65b04808a40fdcae13f4a",
+    "frontend-theme-vars": "26077684407408cb34cb3d14bcf8d9b951e4c8ec42c2fdf978bc453276daf814",
+    "frontend-validation": "7123cf7fdedaf7478835d5a80a2dfd7392ba9097a55c74a7145738245e62c9cb",
+    "mobile-conflict-merge": "146c609f967d7854282d0e725379461754530d5b42df187346a96a10c4f6592f",
+    "mobile-deeplink": "b59e0485b76c99eefb780dd78d387a69a781eefdc4395c4de0496661d442ce70",
+    "mobile-sync-queue": "db0d6df7bad18d085e24bfd7b4bc9092dfeff402289dbd6b0ea36b45422e93d6",
+    "refactor-parser": "781502645b99249b83cf37d1e194ed198c1e5b038484010f6559355b05b2770f",
+    "refactor-phone": "5bfcb044461502a172e4c236943cc6dab6e76cfc74aa9bc21c30e35924010abb",
+    "refactor-shipping": "3567d41ea51ffd2997749bd890cdf29264cfca519406beb9355f91c7edc6ae79",
+    "refactor-validators": "ba4669d7f63e4b0d525574c5c80015ffc7a62bd9956d80b024486461ebf22ecc"
+  },
+  "supersedes": {
+    "backend-idempotency-v2": "backend-idempotency",
+    "debugging-money-round-v2": "debugging-money-round"
+  }
+}

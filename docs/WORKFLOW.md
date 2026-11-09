@@ -10,7 +10,7 @@ research platform. These instructions are *not* injected into models under test.
 2. Make one focused change. Let your editor format Python on save, or use
    `make format` when preparing the patch.
 3. `make check` runs the same offline checks as `./check.sh`: Ruff, Ruff format,
-   ty, sandbox regression tests, and the 24 golden/baseline tests. Use
+   ty, sandbox regression tests, and the golden/baseline tests for every task. Use
    `git diff --check` for whitespace errors.
 4. Open a small PR with exact evidence: affected behavior, tests and outputs,
    unchanged experiment invariants, and any manual verification required.

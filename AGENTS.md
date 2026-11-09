@@ -9,7 +9,7 @@ frameworks or abstractions.
 
 - `make help` lists the developer commands. `make setup` synchronizes `uv.lock`.
 - `make check` is the canonical local CI-equivalent verification (`./check.sh`).
-- `make selfcheck` runs offline harness, sandbox, and 24 golden/baseline checks.
+- `make selfcheck` runs offline harness, sandbox, suite-integrity, and golden/baseline checks for every task.
 - `make report` reads EXP-2 results; it does not launch the GPU experiment.
 - See `bench/README.md` for benchmark internals, `experiments/EXP-2_PROTOCOL.md`
   for the registered experiment, and `docs/WORKFLOW.md` for task-specific steps.
