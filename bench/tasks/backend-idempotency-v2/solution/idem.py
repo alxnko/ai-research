@@ -23,21 +23,20 @@ def run_once(store, key, fn):
                 "error": None,
             }
     if owner:
+        # Whatever happens, retire the entry and wake the waiters under the
+        # guard, so none of them can block on a call that no longer runs.
         try:
             value = fn()
-        except BaseException as exc:
-            # publish the failure and retire the entry in one step, so a new
-            # caller either joins this call or starts after it has finished
             with _GUARD:
-                slot["error"] = exc
+                store[key] = value
+                slot["value"] = value
+        except BaseException as exc:
+            slot["error"] = exc
+            raise
+        finally:
+            with _GUARD:
                 _INFLIGHT.pop(ident, None)
                 slot["event"].set()
-            raise
-        with _GUARD:
-            store[key] = value
-            slot["value"] = value
-            _INFLIGHT.pop(ident, None)
-            slot["event"].set()
         return value
     slot["event"].wait()
     if slot["error"] is not None:

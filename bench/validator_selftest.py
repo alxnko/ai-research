@@ -762,13 +762,17 @@ def _occupied_run_dir_gate() -> list[Failure]:
         try:
             marker = '{"kept": true}'
             _write(os.path.join(run_dir, name), marker)
-            proc = subprocess.run(
-                [sys.executable, bench_py, "--run-dir", run_dir, "--suite", "v0.5"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env={**os.environ, "BENCH_MOCK_MODEL": "1"},
-            )
+            try:
+                proc = subprocess.run(
+                    [sys.executable, bench_py, "--run-dir", run_dir, "--suite", "v0.5"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={**os.environ, "BENCH_MOCK_MODEL": "1"},
+                )
+            except subprocess.TimeoutExpired:
+                out.append(("run-dir", f"occupied run dir ({name}) started a run", ""))
+                continue
             with open(os.path.join(run_dir, name)) as f:
                 intact = f.read() == marker
             _expect(

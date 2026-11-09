@@ -198,6 +198,22 @@ class TestSameKeyConcurrency(unittest.TestCase):
                 ran_at[0], returned - 0.1, "fn restarted before the failure was delivered"
             )
 
+    def test_waiters_are_released_when_storing_the_result_fails(self):
+        class Refusing(collections.UserDict):
+            def __setitem__(self, key, value):
+                raise OSError("disk full")
+
+        store, gate = Refusing(), Gate(result="v")
+        owner = in_thread(run_once, store, "k", gate)
+        await_entry(self, gate, [owner])
+        waiter = in_thread(run_once, store, "k", lambda: "never")
+        time.sleep(0.05)
+        gate.release.set()
+        owner[0].join(BLOCKED)
+        waiter[0].join(BLOCKED)
+        self.assertFalse(waiter[0].is_alive(), "a waiter was left blocked")
+        self.assertIsInstance(owner[1].get("e"), OSError)
+
 
 class TestStoreScoping(unittest.TestCase):
     """The same key in different stores is an independent request."""

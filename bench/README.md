@@ -120,6 +120,8 @@ uv run python bench/bench.py --model qwen3.5:4b --actuator native_tools --suite 
 
 # Resume an interrupted run. A suite run resumes with its saved suite (no flag
 # needed) and cannot switch suites; a --task run resumes with --task.
+# A fresh run refuses a --run-dir that already holds config.json/results.json;
+# an interrupted cell must be resumed (or moved aside), never restarted in place.
 uv run python bench/bench.py --resume runs/20261105-xxxx-tag
 
 # Run full harness selfcheck (regression tests, integration tests, golden checks)

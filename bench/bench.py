@@ -1659,8 +1659,12 @@ def _resolve_run_dir_and_config(
         "strict_isolation": args.strict_isolation,
         "sampling": sampling.to_dict(),
     }
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+    try:  # "x": never overwrite a config another process just created
+        with open(os.path.join(run_dir, "config.json"), "x") as f:
+            json.dump(cfg, f, indent=2)
+    except FileExistsError:
+        print(f"Error: {run_dir} already holds a run.", file=sys.stderr)
+        sys.exit(1)
     return run_dir, cfg, sampling
 
 
