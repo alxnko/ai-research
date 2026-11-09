@@ -74,8 +74,10 @@ Tags `v0.2`–`v0.4` are annotated and pushed. Experiments pin a tag; see
 
 - Benchmark harness: complete, self-checked (every task fails unsolved and
   passes with its golden solution); CI runs the self-check under bubblewrap.
-- Model comparison sweep: in progress. Qwen3.5-4B Q4/64K, Qwen3.5-4B Q5/64K,
-  Qwen3.5-4B Q6/32K, Ornith-1.5-9B IQ3/16K.
+- EXP-2 (verification prompt policy, Qwen3.5-4B): 6/18 control vs 9/18
+  treatment, 17.63 vs 26.54 verified tasks/hour at equal total task time.
+  Provisional: N=18 per arm, overlapping intervals. See
+  `experiments/EXP-2_RESULTS.md`.
 - Retrieval / harness ablation: not started.
 
 Results are not published yet. Do not treat any single-run number as final.
