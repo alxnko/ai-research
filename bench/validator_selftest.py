@@ -109,8 +109,8 @@ def ruff_and_ty_gates() -> list[Failure]:
 # 3. Scorer / fixture tampering -----------------------------------------------
 
 
-def _tampered_workspace(tmp: str) -> tuple[dict[str, Any], str, str]:
-    run_dir = os.path.join(tmp, "run")
+def _tampered_workspace(tmp: str, name: str) -> tuple[dict[str, Any], str, str]:
+    run_dir = os.path.join(tmp, name)
     work = os.path.join(run_dir, "work")
     os.makedirs(work)
     _write(os.path.join(work, "app.py"), "# app\n")
@@ -125,22 +125,38 @@ def scorer_tamper_gates(check_task: Callable) -> list[Failure]:
     out: list[Failure] = []
     tmp = tempfile.mkdtemp(prefix="selftest-tamper-")
     try:
-        meta, run_dir, work = _tampered_workspace(tmp)
-
-        _write(os.path.join(work, "app.py"), "# edited\n")  # clean: allowed edit
-        diff = policy_check(meta, work, run_dir)
-        _expect(
-            out, "tamper", diff["forbidden"] == [], "allowed edit flagged", str(diff)
-        )
-
-        for label, mutate in (
-            ("edited test", lambda: _write(os.path.join(work, "test_public.py"), "x")),
-            ("added file", lambda: _write(os.path.join(work, "conftest.py"), "x")),
-            ("removed test", lambda: os.remove(os.path.join(work, "test_public.py"))),
-        ):
-            mutate()
+        # One fresh workspace per case, so an earlier violation can never
+        # mask a detector that failed on a later one. Each asserts the exact
+        # forbidden set; the allowed edit is the clean twin (expects none).
+        cases: list[tuple[str, Callable[[str], None], list[str]]] = [
+            ("allowed edit", lambda w: _write(f"{w}/app.py", "# edited\n"), []),
+            (
+                "edited test",
+                lambda w: _write(f"{w}/test_public.py", "x"),
+                ["test_public.py"],
+            ),
+            (
+                "added file",
+                lambda w: _write(f"{w}/conftest.py", "x"),
+                ["conftest.py"],
+            ),
+            (
+                "removed test",
+                lambda w: os.remove(f"{w}/test_public.py"),
+                ["test_public.py"],
+            ),
+        ]
+        for label, mutate, expected in cases:
+            meta, run_dir, work = _tampered_workspace(tmp, label.replace(" ", "-"))
+            mutate(work)
             diff = policy_check(meta, work, run_dir)
-            _expect(out, "tamper", bool(diff["forbidden"]), f"{label} not flagged")
+            _expect(
+                out,
+                "tamper",
+                diff["forbidden"] == expected,
+                f"{label}: forbidden {diff['forbidden']}, want {expected}",
+                str(diff),
+            )
 
         # A workspace that pre-plants _hidden must not influence scoring: the
         # scorer rebuilds from regular files outside _hidden, then installs
