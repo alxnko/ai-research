@@ -40,7 +40,11 @@ jobs:
           uvx zizmor@1.32.0 --offline .github/workflows
 
       - name: ShellCheck (maintained scripts)
-        run: uvx --from shellcheck-py==0.11.0.1 shellcheck check.sh experiments/run_exp2.sh
+        run: |
+          uvx --from shellcheck-py==0.11.0.1 shellcheck check.sh
+          # SC2164 only: the frozen EXP-2 runner uses `set -uo pipefail` without -e
+          # and must not be edited. Revisit when the experiment controller replaces it.
+          uvx --from shellcheck-py==0.11.0.1 shellcheck --exclude=SC2164 experiments/run_exp2.sh
 
       - name: Ruff Lint & Format Check
         run: |
