@@ -11,6 +11,7 @@ Entry point: validator_selftests(check_task), called from bench/selfcheck.py.
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import contextlib
 import io
@@ -605,7 +606,8 @@ def suite_gates() -> list[Failure]:
                 out,
                 "suites",
                 task_digest(tid) == digest,
-                f"{name}: fixture {tid} changed since the suite was frozen",
+                f"{name}: fixture {tid} changed since the suite was frozen "
+                "(edited, or stray files such as __pycache__)",
             )
     in_any = {tid for suite in suites.values() for tid in suite["tasks"]}
     _expect(
@@ -665,6 +667,79 @@ def suite_gates() -> list[Failure]:
             )
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
+    out.extend(_suite_selection_gates())
+    return out
+
+
+def _resume_cli(config: dict[str, Any], args: list[str]) -> subprocess.CompletedProcess:
+    run_dir = tempfile.mkdtemp(prefix="selftest-resume-")
+    try:
+        _write(os.path.join(run_dir, "config.json"), json.dumps(config))
+        return subprocess.run(
+            [
+                sys.executable,
+                os.path.join(REPO_ROOT, "bench", "bench.py"),
+                "--resume",
+                run_dir,
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "BENCH_MOCK_MODEL": "1"},
+        )
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _suite_selection_gates() -> list[Failure]:
+    """A resumed run stays inside its suite; digests are enforced at run time."""
+    out: list[Failure] = []
+    base = {"model": "qwen2.5-coder:7b"}
+    legacy, fixed = "backend-idempotency", "backend-idempotency-v2"
+    cases = [
+        ("other suite", "v0.4", ["--suite", "v0.5"], "cannot resume"),
+        ("task outside suite", "v0.4", ["--task", fixed], "not in suite"),
+        ("suite on a suite-less run", "", ["--suite", "v0.5"], "cannot resume"),
+        ("no selector, no suite", "", [], "specify --task"),
+    ]
+    for label, saved, args, want in cases:
+        proc = _resume_cli({**base, "suite": saved}, args)
+        _expect(
+            out,
+            "suites",
+            proc.returncode != 0 and want in proc.stderr,
+            f"resume ({label}) was not refused",
+            proc.stderr,
+        )
+
+    def pick(task=None, suite=None, saved="", resume=True):
+        resume_dir = "x" if resume else None
+        args = argparse.Namespace(task=task, suite=suite, resume=resume_dir)
+        return bench_mod._selected_task_ids(args, saved)
+
+    v04, v05 = list(load_suite("v0.4")["tasks"]), list(load_suite("v0.5")["tasks"])
+    _expect(out, "suites", pick(saved="v0.4") == v04, "resume ignored the saved suite")
+    _expect(
+        out,
+        "suites",
+        pick(task=legacy, saved="v0.4") == [legacy],
+        "legacy task refused",
+    )
+    _expect(
+        out, "suites", pick(suite="v0.5", resume=False) == v05, "fresh --suite failed"
+    )
+    _expect(
+        out, "suites", pick(task=fixed, resume=False) == [fixed], "fresh --task failed"
+    )
+    with mock.patch.object(bench_mod, "task_digest", lambda _tid: "0" * 64):
+        try:
+            pick(suite="v0.5", resume=False)
+            out.append(("suites", "--suite ran fixtures that differ from its pins", ""))
+        except ValueError as exc:
+            _expect(
+                out, "suites", "differ" in str(exc), "digest drift message", str(exc)
+            )
     return out
 
 
@@ -673,8 +748,6 @@ def _run_mutant(meta: dict[str, Any], mutant: str) -> tuple[bool, str]:
     try:
         work = prepare(meta, tmp)
         target = os.listdir(meta["solution_dir"])
-        if len(target) != 1:
-            return True, "oracle mutants need a single-file solution"
         shutil.copy2(mutant, os.path.join(work, target[0]))
         # fail fast: one failing test proves the oracle rejects this mutant
         return score(dict(meta, test_cmd=meta["test_cmd"] + " -f"), work, tmp)
@@ -693,6 +766,9 @@ def oracle_mutant_gates() -> list[Failure]:
         if not os.path.isdir(mdir):
             continue
         files = sorted(f for f in os.listdir(mdir) if f.endswith(".py"))
+        if len(os.listdir(meta["solution_dir"])) != 1:
+            out.append((tid, "oracle mutants need a single-file solution", ""))
+            continue
         _expect(out, "oracle_mutants", bool(files), f"{tid}: mutants/ is empty")
         jobs += [(tid, os.path.join(mdir, f), meta) for f in files]
     _expect(out, "oracle_mutants", bool(jobs), "no oracle mutants found")

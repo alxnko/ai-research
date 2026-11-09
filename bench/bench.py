@@ -1619,6 +1619,7 @@ def _resolve_run_dir_and_config(
             "repeat": saved.get("repeat", args.repeat),
             "max_wall": saved.get("max_wall", args.max_wall),
             "actuator": saved.get("actuator", args.actuator),
+            "suite": saved.get("suite", ""),
             "strict_isolation": saved.get("strict_isolation", False)
             or args.strict_isolation,
         }
@@ -1641,6 +1642,7 @@ def _resolve_run_dir_and_config(
         "max_wall": args.max_wall,
         "tag": args.tag or "",
         "task": args.task or "",
+        "suite": args.suite or "",
         "actuator": args.actuator,
         "strict_isolation": args.strict_isolation,
         "sampling": sampling.to_dict(),
@@ -1650,14 +1652,37 @@ def _resolve_run_dir_and_config(
     return run_dir, cfg, sampling
 
 
-def _selected_task_ids(args: argparse.Namespace) -> list[str]:
-    """Exactly one of --task / --suite; never "everything on disk"."""
+def _suite_task_ids(name: str) -> list[str]:
+    """A suite's tasks, verified against the fixture digests it pins."""
+    pinned = load_suite(name)["tasks"]
+    drifted = [t for t, digest in pinned.items() if task_digest(t) != digest]
+    if drifted:
+        raise ValueError(
+            f"fixtures differ from suite {name!r} pins: {drifted} "
+            "(edited task files, or stray files such as __pycache__)."
+        )
+    return list(pinned)
+
+
+def _selected_task_ids(args: argparse.Namespace, saved_suite: str = "") -> list[str]:
+    """Exactly one of --task / --suite; never "everything on disk".
+
+    `saved_suite` is the suite a resumed run started with. A suite run stays
+    inside that suite; a run that did not start from a suite cannot adopt one.
+    """
     if args.task and args.suite:
         raise ValueError("use --task or --suite, not both.")
-    if args.suite:
-        return list(load_suite(args.suite)["tasks"])
+    if args.suite and saved_suite != args.suite and (args.resume or saved_suite):
+        started = f"with suite {saved_suite!r}" if saved_suite else "without a suite"
+        raise ValueError(
+            f"cannot resume with --suite {args.suite!r}: the run was started {started}."
+        )
     if args.task:
+        if saved_suite and args.task not in load_suite(saved_suite)["tasks"]:
+            raise ValueError(f"{args.task!r} is not in suite {saved_suite!r}.")
         return [args.task]
+    if args.suite or saved_suite:
+        return _suite_task_ids(args.suite or saved_suite)
     raise ValueError(
         "specify --task <id> or --suite <name> "
         f"(available suites: {', '.join(available_suites()) or 'none'})."
@@ -1725,7 +1750,7 @@ def main() -> int:
         return 1
 
     try:
-        ids = ids or _selected_task_ids(args)
+        ids = ids or _selected_task_ids(args, cfg.get("suite", ""))
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

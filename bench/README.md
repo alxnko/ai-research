@@ -77,8 +77,14 @@ cannot drift silently.
 
 `bench.py` requires `--task` or `--suite`; it never runs "everything on disk",
 so legacy and corrected task versions cannot be evaluated together by accident.
-Do not mix suites inside one comparison. Scores from `v0.4` and `v0.5` are not
+`--suite` also checks each task's fixture digest against the suite before it
+runs, and a resumed suite run cannot switch to another suite. Do not mix suites
+inside one comparison. Scores from `v0.4` and `v0.5` are not
 directly comparable for the two replaced tasks.
+
+EXP-2 is complete and frozen at tag `v0.4`: its protocol requires `bench.py`
+to match that tag, so any rerun must check out `v0.4` (the suite machinery here
+is not part of it).
 
 Why the two `-v2` tasks exist: the original `backend-idempotency` reference
 solution shared in-flight state across stores (so one store's caller could wait
@@ -109,10 +115,11 @@ uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --suite v0
 uv run python bench/bench.py --model qwen3.5:4b --ctx 32768 --ngpu 99 --task debugging-default-arg
 
 # Compare actuators (Arm A vs Arm B)
-uv run python bench/bench.py --model qwen3.5:4b --actuator text --tag text-arm
-uv run python bench/bench.py --model qwen3.5:4b --actuator native_tools --tag tools-arm
+uv run python bench/bench.py --model qwen3.5:4b --actuator text --suite v0.5 --tag text-arm
+uv run python bench/bench.py --model qwen3.5:4b --actuator native_tools --suite v0.5 --tag tools-arm
 
-# Resume interrupted run
+# Resume an interrupted run. A suite run resumes with its saved suite (no flag
+# needed) and cannot switch suites; a --task run resumes with --task.
 uv run python bench/bench.py --resume runs/20261105-xxxx-tag
 
 # Run full harness selfcheck (regression tests, integration tests, golden checks)
