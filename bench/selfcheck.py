@@ -46,6 +46,7 @@ from bench.telemetry import (
     parse_stream_chunk_event,
     summarize_inference,
 )
+from bench.validator_selftest import validator_selftests
 
 
 def parser_checks() -> list[tuple[str, str, str]]:
@@ -1860,9 +1861,14 @@ def attempt(
     return (0 if passed else 1), out, diff
 
 
-def check_task(tid: str) -> tuple[str, list[tuple[str, str, str]]]:
-    """Runs in a worker thread; every attempt gets its own temp workspace."""
-    meta = load_task(tid)
+def check_task(
+    tid: str, meta: dict[str, Any] | None = None
+) -> tuple[str, list[tuple[str, str, str]]]:
+    """Runs in a worker thread; every attempt gets its own temp workspace.
+
+    `meta` lets validator self-tests run the same check on a doctored copy.
+    """
+    meta = meta or load_task(tid)
     base_code, base_out, _ = attempt(meta, solution=False)
     sol_code, sol_out, diff = attempt(meta, solution=True)
     unsolved_ok = base_code != 0
@@ -1934,6 +1940,9 @@ def main() -> int:
 
     print("Running sandbox output symlink security tests...")
     failures.extend(sandbox_output_symlink_regression_test())
+
+    print("Running validator self-tests (each defect must be caught)...")
+    failures.extend(validator_selftests(check_task))
 
     ids = all_tasks()
     print(f"Running golden solution checks for {len(ids)} tasks in parallel...")
