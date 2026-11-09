@@ -7,3 +7,10 @@ bench/runs/
 __pycache__/
 *.py[cod]
 .venv/
+
+# personal machine-specific instructions and local environment values
+CLAUDE.local.md
+AGENTS.override.md
+.env
+.env.*
+!.env.example
