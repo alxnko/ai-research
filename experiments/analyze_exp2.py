@@ -48,10 +48,17 @@ def load() -> dict[tuple[str, int, str], dict]:
         arm = path.split(os.sep)[-4]
         seed = int(path.split(os.sep)[-3].removeprefix("seed"))
         task = path.split(os.sep)[-2]
-        if arm in ARMS and task in TASKS:
+        if arm not in ARMS or task not in TASKS:
+            continue
+        try:
             with open(path) as f:
                 rows = json.load(f)
-            records[(arm, seed, task)] = rows[0] if rows else {}
+        except ValueError:
+            continue
+        row = rows[0] if isinstance(rows, list) and len(rows) == 1 else {}
+        required = {"task", "passed", "run_successful", "total_wall_s", "tokens"}
+        if required <= set(row) and row["task"] == task:
+            records[(arm, seed, task)] = row
     return records
 
 
@@ -123,11 +130,12 @@ def main() -> int:
             f"{lo * 100:.0f}-{hi * 100:.0f}%)  "
             f"{d['verified_tasks_per_hour']} tasks/h over {d['total_wall_s']}s"
         )
-        print(
-            f"  median {d['median_wall_s']}s  p95 {d['p95_wall_s']}s  "
-            f"tokens {d['tokens_evaluated']} (incomplete runs "
-            f"{d['tokens_incomplete_runs']})"
-        )
+        if d["attempts"]:
+            print(
+                f"  median {d['median_wall_s']}s  p95 {d['p95_wall_s']}s  "
+                f"tokens {d['tokens_evaluated']} (incomplete runs "
+                f"{d['tokens_incomplete_runs']})"
+            )
         print(
             f"  inference errors {d['inference_errors']}  timeouts "
             f"{d['timeouts']}  invalid actions {d['invalid_actions']}  "
@@ -158,6 +166,14 @@ def main() -> int:
     t_wins = sum(1 for k in paired if ok("verification", k) and not ok("control", k))
     c_wins = sum(1 for k in paired if ok("control", k) and not ok("verification", k))
     print(f"\npaired discordance: treatment-only {t_wins}, control-only {c_wins}")
+
+    if len(records) != 36 or missing:
+        print(
+            f"\nINCOMPLETE: {len(records)}/36 valid records. "
+            "The decision rule is withheld until every arm/seed/task "
+            "combination has a valid result."
+        )
+        return 0
 
     c, t = stats["control"], stats["verification"]
     if c["verified_tasks_per_hour"] and t["verified_tasks_per_hour"]:
