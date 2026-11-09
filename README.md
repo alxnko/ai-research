@@ -37,10 +37,27 @@ in v0.1 but kept frozen so pilot numbers stay comparable:
 - the sandbox exposed the whole host filesystem read-only, not just the
   toolchain it needs.
 
+**v0.1–v0.4 — hardened runner.**
+
+- `v0.1` curates the sandbox mounts, rebuilds a clean scoring workspace from
+  regular files only, makes forbidden changes fail scoring, caps output and
+  process resources, and snapshots the workspace instead of trusting `.git`.
+- `v0.2` adds streaming telemetry, two-axis failure classification, the
+  native-tools actuator, and cgroup v2 isolation.
+- `v0.3` moves inference to a `forkserver` worker with an absolute monotonic
+  deadline, cancels in-flight requests at the deadline, and marks interrupted
+  token accounting as incomplete.
+- `v0.4` reads Ollama's v2 manifest layout, so each run records the full
+  manifest, config and weights digests, and restores green lint, format and
+  type gates.
+
+Tags `v0.2`–`v0.4` are annotated and pushed. Experiments pin a tag; see
+`experiments/EXP-2_PROTOCOL.md` for the first preregistered comparison.
+
 ## Status
 
 - Benchmark harness: complete, self-checked (every task fails unsolved and
-  passes with its golden solution).
+  passes with its golden solution); CI runs the self-check under bubblewrap.
 - Model comparison sweep: in progress. Qwen3.5-4B Q4/64K, Qwen3.5-4B Q5/64K,
   Qwen3.5-4B Q6/32K, Ornith-1.5-9B IQ3/16K.
 - Retrieval / harness ablation: not started.
