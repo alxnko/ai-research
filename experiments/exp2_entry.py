@@ -14,7 +14,6 @@ import sys
 
 from bench import bench as benchmark
 
-
 BASE_PROMPT = benchmark.SYSTEM_PROMPT_TOOLS
 OLD_SENTENCE = "Ensure all changes are verified before finishing."
 NEW_SENTENCE = (
@@ -29,13 +28,26 @@ if BASE_PROMPT.count(OLD_SENTENCE) != 1:
 
 VERIFY_PROMPT = BASE_PROMPT.replace(OLD_SENTENCE, NEW_SENTENCE, 1)
 
+# Weights and config both arms must load. qwen3.5:4b resolves to the same
+# manifest, so the two tags are identity-equivalent, not interchangeable.
+EXPECTED_MODEL = {
+    "manifest_digest": (
+        "sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04"
+    ),
+    "weights_digest": (
+        "sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50"
+    ),
+}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="EXP-2 control/verification policy wrapper (same bench core)",
         add_help=False,
     )
-    parser.add_argument("--exp2-policy", choices=("control", "verification"), required=True)
+    parser.add_argument(
+        "--exp2-policy", choices=("control", "verification"), required=True
+    )
     parser.add_argument("--run-dir", required=True)
     args, bench_args = parser.parse_known_args()
 
@@ -74,9 +86,12 @@ def main() -> int:
         if getattr(parsed, key) != value:
             raise SystemExit(f"EXP-2 configuration mismatch: {key} must be {value!r}")
     allowed_tasks = {
-        "backend-auth-token", "backend-idempotency",
-        "debugging-off-by-one", "debugging-money-round",
-        "refactor-parser", "refactor-validators",
+        "backend-auth-token",
+        "backend-idempotency",
+        "debugging-off-by-one",
+        "debugging-money-round",
+        "refactor-parser",
+        "refactor-validators",
     }
     if parsed.task not in allowed_tasks or parsed.seed not in {42, 43, 44}:
         raise SystemExit("EXP-2 requires one preregistered task and seed 42/43/44")
@@ -84,11 +99,19 @@ def main() -> int:
         raise SystemExit(f"Unregistered benchmark arguments: {unknown!r}")
 
     expected_dir = os.path.join(
-        benchmark.ROOT, "runs", "exp2", args.exp2_policy,
-        f"seed{parsed.seed}", parsed.task,
+        benchmark.ROOT,
+        "runs",
+        "exp2",
+        args.exp2_policy,
+        f"seed{parsed.seed}",
+        parsed.task,
     )
     if os.path.abspath(args.run_dir) != expected_dir:
         raise SystemExit(f"EXP-2 output must be {expected_dir}")
+
+    fingerprint = benchmark.model_fingerprint(parsed.model)
+    if any(fingerprint.get(k) != v for k, v in EXPECTED_MODEL.items()):
+        raise SystemExit(f"EXP-2 model identity mismatch: {fingerprint}")
 
     prompt = BASE_PROMPT if args.exp2_policy == "control" else VERIFY_PROMPT
     digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -99,8 +122,9 @@ def main() -> int:
     record_path = os.path.join(resolved, "exp2_policy.json")
     record = {
         "experiment": "EXP-2",
-        "benchmark_tag": "v0.3",
-        "benchmark_core_commit": "dd3f6bcde28e6ba8db8b8c83d2d20f2f91562e00",
+        "benchmark_tag": "v0.4",
+        "benchmark_core_commit": "da36111",
+        "model_fingerprint": fingerprint,
         "policy": args.exp2_policy,
         "prompt_sha256": digest,
         "benchmark_argv": bench_args,
@@ -109,11 +133,15 @@ def main() -> int:
         with open(record_path, encoding="utf-8") as f:
             old_record = json.load(f)
         if old_record != record:
-            raise SystemExit("Existing EXP-2 output has a different policy or CLI invocation")
+            raise SystemExit(
+                "Existing EXP-2 output has a different policy or CLI invocation"
+            )
     else:
         with open(record_path, "x", encoding="utf-8") as f:
             json.dump(record, f, indent=2, sort_keys=True)
 
+    # The module constant is typed as its literal text; swapping it is the
+    # single registered change this wrapper is allowed to make.
     benchmark.SYSTEM_PROMPT_TOOLS = prompt
     print(f"EXP-2 policy={args.exp2_policy} prompt_sha256={digest}", flush=True)
     sys.argv = [sys.argv[0], "--run-dir", args.run_dir, *bench_args]

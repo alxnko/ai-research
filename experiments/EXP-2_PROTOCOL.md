@@ -12,7 +12,7 @@ EXP-1C (historical v0.2) reported Qwen3.5-4B Q4_K_M native-tool performance of 8
 
 ## Frozen controller and identical arm settings
 
-Benchmark core: git annotated tag **v0.3**, target commit `dd3f6bcde28e6ba8db8b8c83d2d20f2f91562e00`; controller fixes must be identical for both arms. The EXP-2-only wrapper `experiments/exp2_entry.py` changes **only** the system prompt selected before invoking `bench.bench.main()`. The wrapper and this protocol must be committed **before** starting either arm; retain that final commit SHA and its file hashes in the analysis.
+Benchmark core: git annotated tag **v0.4**, target commit `da36111`; controller fixes must be identical for both arms. The EXP-2-only wrapper `experiments/exp2_entry.py` changes **only** the system prompt selected before invoking `bench.bench.main()`. The wrapper and this protocol must be committed **before** starting either arm; retain that final commit SHA and its file hashes in the analysis.
 
 - Model: **`qwen3.5:4b-q4_K_M`**, with weights/config digests and full manifest fingerprint matching historical EXP-1C. The `qwen3.5:4b` smoke-test tag is *not* an acceptable substitute unless exact digest equivalence is verified and recorded.
 - Actuator: `native_tools`; Ollama `/api/chat`, existing `execute_command` and `finish_task` tool schemas.
@@ -35,6 +35,31 @@ with the following fixed text, verbatim:
 > Before finishing, verify the requested behavior using available public tests and targeted checks for relevant boundary conditions, input types, error handling, and behavioral invariants. If a check fails, inspect the failure and repair the implementation. Do not access hidden evaluation tests.
 
 All other system-prompt lines, user task instructions, tools, and budgets are unchanged. The generic policy must not contain task-specific references to idempotency, concurrency, monetary rounding, or the private tests.
+
+## Core version and model identity (recorded before the first attempt)
+
+The protocol originally froze v0.3 (`dd3f6bc`). Before any EXP-2 attempt,
+the core was advanced to **v0.4** (`da36111`) because v0.3 could not satisfy
+preflight: `model_fingerprint()` read only the legacy
+`~/.ollama/models/manifests` layout, so Ollama 0.40 tags written under
+`manifests-v2/` were recorded as the 12-char `ollama list` ID with no weights
+digest, and the CI lint gate had been failing since `2086ef3`. v0.4 changes
+only manifest resolution, code formatting and lint configuration. Sandbox,
+scoring, agent loop, prompts and telemetry semantics are byte-identical.
+Both arms run on v0.4; no EXP-2 result exists for any earlier core.
+
+Verified identity for the registered model, and for the `qwen3.5:4b` tag used
+in the v0.3 smoke test:
+
+| tag | manifest digest | config digest | weights digest |
+| --- | --- | --- | --- |
+| `qwen3.5:4b-q4_K_M` | `sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04` | `sha256:788a4d94bc3f431ac0cd067005be4b838a09330427962952420b05d10ecf84db` | `sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50` |
+| `qwen3.5:4b` | `sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04` | `sha256:788a4d94bc3f431ac0cd067005be4b838a09330427962952420b05d10ecf84db` | `sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50` |
+
+The two tags resolve to the same manifest, config and weights layer; they
+differ only in baked-in sampling defaults, which the runner always overrides.
+The wrapper still requires the registered tag and records the fingerprint in
+`exp2_policy.json`.
 
 ## Preselected tasks (six, all in both arms)
 
@@ -63,8 +88,8 @@ Run seeds **42, 43, 44** for each arm: 18 control + 18 treatment = **36 attempts
 
 ## Preflight and stop rules
 
-1. Verify current code against v0.3 core (diff `bench/bench.py`, `bench/telemetry.py`, `bench/selfcheck.py` exactly zero vs tag); wrapper/protocol files are the only experiment additions.
-2. Verify target Qwen alias manifest, weights/config digest, GPU layers and Ollama service settings; ensure the exact model is tested, not the separate `qwen3.5:4b` tag used in the v0.3 smoke.
+1. Verify current code against v0.4 core (diff `bench/bench.py`, `bench/telemetry.py`, `bench/selfcheck.py` exactly zero vs tag); wrapper/protocol files are the only experiment additions.
+2. Verify target Qwen alias manifest, weights/config digest, GPU layers and Ollama service settings; ensure the exact model is tested, not the separate `qwen3.5:4b` tag used in the v0.3 smoke. The wrapper fails closed if the resolved fingerprint differs from the registered one.
 3. Run `uv run python bench/selfcheck.py` and a small **non-scored** prompt-wrapper parity check that compares the two fully expanded system prompts. Do not use scored tasks as an informal pre-run selection procedure.
 4. If missing results, model mismatch, broken isolation, controller crash, GPU offload mismatch or unrecoverable Ollama fault occurs, pause experiment for infrastructure investigation. Coding failures and deadline outcomes are valid and do not stop the study.
 5. Preserve every run, including infra failures, and mark any rerun/replacement explicitly. Report all attempted experiments and any deviations; never silently omit/censor errors.
