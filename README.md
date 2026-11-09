@@ -5,9 +5,25 @@ real software-engineering work on an 8 GB consumer GPU faster and more reliably
 than a larger, more aggressively quantized model — and how much of any gain
 comes from the model versus the agent harness around it.
 
-Hardware under test: NVIDIA RTX 5050 Laptop, 8151 MiB VRAM, 30 GB RAM, CUDA
-driver 615.78.08, Ollama 0.40.13, user-level systemd unit with flash attention,
-`q8_0` KV cache, single resident model.
+Research device: NVIDIA RTX 5050 Laptop with 8,151 MiB VRAM. Driver,
+Ollama version, and runtime settings differ by experiment; each run's
+`env.json` and registered protocol are the source of truth for provenance.
+
+## Quick start for contributors and coding agents
+
+```bash
+make help        # discover commands; no GPU jobs start
+make doctor      # check local prerequisites
+make setup       # sync the locked Python environment
+make check       # Ruff + format + ty + offline sandbox/golden selfchecks
+make report      # read EXP-2 results without generating anything
+```
+
+Repository agent instructions are in [`AGENTS.md`](AGENTS.md). Claude Code
+uses [`CLAUDE.md`](CLAUDE.md) to import the same rules, with no duplicate
+policy to maintain. For task-specific procedures read
+[`docs/WORKFLOW.md`](docs/WORKFLOW.md). GPU experiments are explicit,
+versioned operations and are **not** part of ordinary verification.
 
 ## What is here
 
