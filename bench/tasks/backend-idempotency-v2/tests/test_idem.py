@@ -156,6 +156,48 @@ class TestSameKeyConcurrency(unittest.TestCase):
         # nothing was cached and nothing is left in flight: a retry runs fn
         self.assertEqual(run_once(store, "k", lambda: "ok"), "ok")
 
+    def test_new_caller_cannot_start_before_waiters_are_signaled(self):
+        # The owner fails while a waiter is parked. A caller arriving right
+        # after the failure may retry, but only once the failure has been
+        # delivered; it must not run fn while the in-flight call is still
+        # unresolved. (A retry that starts after the first call finished is
+        # legitimate; one that starts well before it returned is not.)
+        store, error = {}, RuntimeError("first")
+        gate = Gate(error=error)
+        owner = in_thread(run_once, store, "k", gate)
+        await_entry(self, gate, [owner])
+        waiter = in_thread(run_once, store, "k", lambda: "never")
+        time.sleep(0.05)  # let the waiter park on the in-flight call
+        ran_at = []
+
+        def late_retry(delay):
+            time.sleep(delay)
+            while not ran_at:
+                try:
+                    return run_once(
+                        store, "k", lambda: ran_at.append(time.monotonic()) or "retry"
+                    )
+                except RuntimeError:
+                    continue  # joined the failing call: not a duplicate start
+
+        gate.release.set()
+        # staggered arrivals, so some land just after the failure begins
+        late = [in_thread(late_retry, 0.02 * n) for n in range(6)]
+        owner[0].join(LONG)
+        returned = time.monotonic()
+        waiter[0].join(LONG)
+        for thread, _ in late:
+            thread.join(LONG)
+        self.assertIs(owner[1].get("e"), error)
+        self.assertIs(waiter[1].get("e"), error)
+        self.assertEqual(gate.calls, 1)
+        if ran_at:
+            # a correct implementation lets the retry start at most a few
+            # milliseconds before the owner's raise is observed
+            self.assertGreaterEqual(
+                ran_at[0], returned - 0.1, "fn restarted before the failure was delivered"
+            )
+
 
 class TestStoreScoping(unittest.TestCase):
     """The same key in different stores is an independent request."""

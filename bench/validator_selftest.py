@@ -668,6 +668,7 @@ def suite_gates() -> list[Failure]:
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     out.extend(_suite_selection_gates())
+    out.extend(_occupied_run_dir_gate())
     return out
 
 
@@ -732,6 +733,15 @@ def _suite_selection_gates() -> list[Failure]:
     _expect(
         out, "suites", pick(task=fixed, resume=False) == [fixed], "fresh --task failed"
     )
+    # a resumed single task is checked against the suite's pinned digests too
+    with mock.patch.object(bench_mod, "task_digest", lambda _tid: "0" * 64):
+        try:
+            pick(task=legacy, saved="v0.4")
+            out.append(("suites", "resume --task ran a drifted fixture", ""))
+        except ValueError as exc:
+            _expect(
+                out, "suites", "differ" in str(exc), "resume drift message", str(exc)
+            )
     with mock.patch.object(bench_mod, "task_digest", lambda _tid: "0" * 64):
         try:
             pick(suite="v0.5", resume=False)
@@ -740,6 +750,43 @@ def _suite_selection_gates() -> list[Failure]:
             _expect(
                 out, "suites", "differ" in str(exc), "digest drift message", str(exc)
             )
+    return out
+
+
+def _occupied_run_dir_gate() -> list[Failure]:
+    """A fresh run never reuses a directory that already holds a run."""
+    out: list[Failure] = []
+    bench_py = os.path.join(REPO_ROOT, "bench", "bench.py")
+    for name in ("config.json", "results.json"):
+        run_dir = tempfile.mkdtemp(prefix="selftest-occupied-")
+        try:
+            marker = '{"kept": true}'
+            _write(os.path.join(run_dir, name), marker)
+            proc = subprocess.run(
+                [sys.executable, bench_py, "--run-dir", run_dir, "--suite", "v0.5"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "BENCH_MOCK_MODEL": "1"},
+            )
+            with open(os.path.join(run_dir, name)) as f:
+                intact = f.read() == marker
+            _expect(
+                out,
+                "run-dir",
+                proc.returncode != 0 and "already holds a run" in proc.stderr,
+                f"occupied run dir ({name}) was reused",
+                proc.stderr,
+            )
+            _expect(out, "run-dir", intact, f"{name} was overwritten")
+            _expect(
+                out,
+                "run-dir",
+                sorted(os.listdir(run_dir)) == [name],
+                "occupied run dir was modified",
+            )
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
     return out
 
 

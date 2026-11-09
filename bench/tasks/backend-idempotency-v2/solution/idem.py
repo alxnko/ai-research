@@ -26,16 +26,18 @@ def run_once(store, key, fn):
         try:
             value = fn()
         except BaseException as exc:
+            # publish the failure and retire the entry in one step, so a new
+            # caller either joins this call or starts after it has finished
             with _GUARD:
+                slot["error"] = exc
                 _INFLIGHT.pop(ident, None)
-            slot["error"] = exc
-            slot["event"].set()
+                slot["event"].set()
             raise
         with _GUARD:
             store[key] = value
+            slot["value"] = value
             _INFLIGHT.pop(ident, None)
-        slot["value"] = value
-        slot["event"].set()
+            slot["event"].set()
         return value
     slot["event"].wait()
     if slot["error"] is not None:

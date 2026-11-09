@@ -1627,6 +1627,18 @@ def _resolve_run_dir_and_config(
 
     if args.run_dir:
         run_dir = os.path.abspath(args.run_dir)
+        held = [
+            n
+            for n in ("config.json", "results.json")
+            if os.path.exists(f"{run_dir}/{n}")
+        ]
+        if held:
+            print(
+                f"Error: {run_dir} already holds a run ({', '.join(held)}); "
+                "use --resume to continue it or choose a new --run-dir.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         tag = f"-{args.tag}" if args.tag else ""
@@ -1677,12 +1689,14 @@ def _selected_task_ids(args: argparse.Namespace, saved_suite: str = "") -> list[
         raise ValueError(
             f"cannot resume with --suite {args.suite!r}: the run was started {started}."
         )
+    suite = args.suite or saved_suite
+    members = _suite_task_ids(suite) if suite else []  # verifies every pin
     if args.task:
-        if saved_suite and args.task not in load_suite(saved_suite)["tasks"]:
+        if saved_suite and args.task not in members:
             raise ValueError(f"{args.task!r} is not in suite {saved_suite!r}.")
         return [args.task]
-    if args.suite or saved_suite:
-        return _suite_task_ids(args.suite or saved_suite)
+    if suite:
+        return members
     raise ValueError(
         "specify --task <id> or --suite <name> "
         f"(available suites: {', '.join(available_suites()) or 'none'})."
