@@ -672,11 +672,29 @@ def suite_gates() -> list[Failure]:
     return out
 
 
-def _resume_cli(config: dict[str, Any], args: list[str]) -> subprocess.CompletedProcess:
+def _resume_cli(
+    config: dict[str, Any], args: list[str]
+) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run `bench.py --resume` on a saved run; also report whether its files
+    (config.json and a stand-in results.json) changed."""
     run_dir = tempfile.mkdtemp(prefix="selftest-resume-")
     try:
         _write(os.path.join(run_dir, "config.json"), json.dumps(config))
-        return subprocess.run(
+        _write(os.path.join(run_dir, "results.json"), '[{"task": "kept"}]')
+
+        def snapshot() -> dict[str, bytes]:
+            files = {}
+            for name in sorted(os.listdir(run_dir)):
+                path = os.path.join(run_dir, name)
+                if os.path.isdir(path):
+                    files[name] = b"<dir>"
+                else:
+                    with open(path, "rb") as f:
+                        files[name] = f.read()
+            return files
+
+        before = snapshot()
+        proc = subprocess.run(
             [
                 sys.executable,
                 os.path.join(REPO_ROOT, "bench", "bench.py"),
@@ -689,6 +707,7 @@ def _resume_cli(config: dict[str, Any], args: list[str]) -> subprocess.Completed
             timeout=60,
             env={**os.environ, "BENCH_MOCK_MODEL": "1"},
         )
+        return proc, snapshot() != before
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
 
@@ -699,13 +718,16 @@ def _suite_selection_gates() -> list[Failure]:
     base = {"model": "qwen2.5-coder:7b"}
     legacy, fixed = "backend-idempotency", "backend-idempotency-v2"
     cases = [
-        ("other suite", "v0.4", ["--suite", "v0.5"], "cannot resume"),
-        ("task outside suite", "v0.4", ["--task", fixed], "not in suite"),
-        ("suite on a suite-less run", "", ["--suite", "v0.5"], "cannot resume"),
-        ("no selector, no suite", "", [], "specify --task"),
+        ("other suite", "v0.4", "", ["--suite", "v0.5"], "cannot resume"),
+        ("task outside suite", "v0.4", "", ["--task", fixed], "not in suite"),
+        ("suite on a suite-less run", "", "", ["--suite", "v0.5"], "cannot resume"),
+        ("no selector, no suite", "", "", [], "specify --task"),
+        ("other task", "", legacy, ["--task", fixed], "cannot resume"),
+        ("suite on a task run", "", legacy, ["--suite", "v0.5"], "cannot resume"),
     ]
-    for label, saved, args, want in cases:
-        proc = _resume_cli({**base, "suite": saved}, args)
+    for label, saved, saved_task, args, want in cases:
+        config = {**base, "suite": saved, "task": saved_task}
+        proc, changed = _resume_cli(config, args)
         _expect(
             out,
             "suites",
@@ -713,14 +735,23 @@ def _suite_selection_gates() -> list[Failure]:
             f"resume ({label}) was not refused",
             proc.stderr,
         )
+        _expect(out, "suites", not changed, f"refused resume ({label}) changed files")
 
-    def pick(task=None, suite=None, saved="", resume=True):
+    def pick(task=None, suite=None, saved="", resume=True, saved_task=""):
         resume_dir = "x" if resume else None
         args = argparse.Namespace(task=task, suite=suite, resume=resume_dir)
-        return bench_mod._selected_task_ids(args, saved)
+        return bench_mod._selected_task_ids(args, saved, saved_task)
 
     v04, v05 = list(load_suite("v0.4")["tasks"]), list(load_suite("v0.5")["tasks"])
     _expect(out, "suites", pick(saved="v0.4") == v04, "resume ignored the saved suite")
+    # the original single task still resumes, with or without repeating --task
+    _expect(
+        out,
+        "suites",
+        pick(task=fixed, saved_task=fixed) == [fixed]
+        and pick(saved_task=fixed) == [fixed],
+        "the original --task could not be resumed",
+    )
     _expect(
         out,
         "suites",

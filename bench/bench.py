@@ -1620,6 +1620,7 @@ def _resolve_run_dir_and_config(
             "max_wall": saved.get("max_wall", args.max_wall),
             "actuator": saved.get("actuator", args.actuator),
             "suite": saved.get("suite", ""),
+            "task": saved.get("task", ""),
             "strict_isolation": saved.get("strict_isolation", False)
             or args.strict_isolation,
         }
@@ -1680,11 +1681,15 @@ def _suite_task_ids(name: str) -> list[str]:
     return list(pinned)
 
 
-def _selected_task_ids(args: argparse.Namespace, saved_suite: str = "") -> list[str]:
+def _selected_task_ids(
+    args: argparse.Namespace, saved_suite: str = "", saved_task: str = ""
+) -> list[str]:
     """Exactly one of --task / --suite; never "everything on disk".
 
     `saved_suite` is the suite a resumed run started with. A suite run stays
     inside that suite; a run that did not start from a suite cannot adopt one.
+    `saved_task` is the single task a resumed run started with: it resumes that
+    task only, so one run identity never holds results for two tasks.
     """
     if args.task and args.suite:
         raise ValueError("use --task or --suite, not both.")
@@ -1693,6 +1698,13 @@ def _selected_task_ids(args: argparse.Namespace, saved_suite: str = "") -> list[
         raise ValueError(
             f"cannot resume with --suite {args.suite!r}: the run was started {started}."
         )
+    if saved_task:
+        if args.task and args.task != saved_task:
+            raise ValueError(
+                f"cannot resume with --task {args.task!r}: "
+                f"the run was started with --task {saved_task!r}."
+            )
+        return [saved_task]
     suite = args.suite or saved_suite
     members = _suite_task_ids(suite) if suite else []  # verifies every pin
     if args.task:
@@ -1768,7 +1780,7 @@ def main() -> int:
         return 1
 
     try:
-        ids = ids or _selected_task_ids(args, cfg.get("suite", ""))
+        ids = ids or _selected_task_ids(args, cfg.get("suite", ""), cfg.get("task", ""))
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
