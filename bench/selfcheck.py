@@ -1086,16 +1086,17 @@ def subprocess_resume_integration_test() -> list[tuple[str, str, str]]:
     env["BENCH_MOCK_MODEL"] = "1"
 
     try:
-        # Step 1: Run single task
+        # Step 1: Run one member of a suite run (a run started with --task
+        # may only resume that task, so this run belongs to a suite)
+        with open(os.path.join(tmp_run, "config.json"), "w") as f:
+            json.dump({"model": "qwen2.5-coder:7b", "suite": "v0.4"}, f)
         cmd1 = [
             sys.executable,
             bench_py,
-            "--run-dir",
+            "--resume",
             tmp_run,
             "--task",
             "debugging-default-arg",
-            "--model",
-            "qwen2.5-coder:7b",
         ]
         res1 = subprocess.run(cmd1, env=env, capture_output=True, text=True, timeout=60)
         if res1.returncode != 0:

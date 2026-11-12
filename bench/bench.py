@@ -32,6 +32,7 @@ from bench.telemetry import (
 )
 
 TASKS = os.path.join(ROOT, "bench", "tasks")
+SUITES = os.path.join(ROOT, "bench", "suites")
 RUNS = os.path.join(ROOT, "runs")
 
 SYSTEM_PROMPT_TEXT = """
@@ -569,6 +570,21 @@ def all_tasks() -> list[str]:
         if os.path.isdir(p) and os.path.exists(os.path.join(p, "meta.json")):
             ids.append(name)
     return ids
+
+
+def available_suites() -> list[str]:
+    if not os.path.isdir(SUITES):
+        return []
+    return sorted(n[:-5] for n in os.listdir(SUITES) if n.endswith(".json"))
+
+
+def load_suite(name: str) -> dict[str, Any]:
+    """A suite pins an exact task set and each task's fixture digest."""
+    path = os.path.join(SUITES, f"{name}.json")
+    if name not in available_suites():
+        raise ValueError(f"unknown suite {name!r}; available: {available_suites()}")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def prepare(meta: dict[str, Any], run_dir: str) -> str:
@@ -1603,6 +1619,8 @@ def _resolve_run_dir_and_config(
             "repeat": saved.get("repeat", args.repeat),
             "max_wall": saved.get("max_wall", args.max_wall),
             "actuator": saved.get("actuator", args.actuator),
+            "suite": saved.get("suite", ""),
+            "task": saved.get("task", ""),
             "strict_isolation": saved.get("strict_isolation", False)
             or args.strict_isolation,
         }
@@ -1610,6 +1628,18 @@ def _resolve_run_dir_and_config(
 
     if args.run_dir:
         run_dir = os.path.abspath(args.run_dir)
+        held = [
+            n
+            for n in ("config.json", "results.json")
+            if os.path.exists(f"{run_dir}/{n}")
+        ]
+        if held:
+            print(
+                f"Error: {run_dir} already holds a run ({', '.join(held)}); "
+                "use --resume to continue it or choose a new --run-dir.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         tag = f"-{args.tag}" if args.tag else ""
@@ -1625,13 +1655,68 @@ def _resolve_run_dir_and_config(
         "max_wall": args.max_wall,
         "tag": args.tag or "",
         "task": args.task or "",
+        "suite": args.suite or "",
         "actuator": args.actuator,
         "strict_isolation": args.strict_isolation,
         "sampling": sampling.to_dict(),
     }
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+    try:  # "x": never overwrite a config another process just created
+        with open(os.path.join(run_dir, "config.json"), "x") as f:
+            json.dump(cfg, f, indent=2)
+    except FileExistsError:
+        print(f"Error: {run_dir} already holds a run.", file=sys.stderr)
+        sys.exit(1)
     return run_dir, cfg, sampling
+
+
+def _suite_task_ids(name: str) -> list[str]:
+    """A suite's tasks, verified against the fixture digests it pins."""
+    pinned = load_suite(name)["tasks"]
+    drifted = [t for t, digest in pinned.items() if task_digest(t) != digest]
+    if drifted:
+        raise ValueError(
+            f"fixtures differ from suite {name!r} pins: {drifted} "
+            "(edited task files, or stray files such as __pycache__)."
+        )
+    return list(pinned)
+
+
+def _selected_task_ids(
+    args: argparse.Namespace, saved_suite: str = "", saved_task: str = ""
+) -> list[str]:
+    """Exactly one of --task / --suite; never "everything on disk".
+
+    `saved_suite` is the suite a resumed run started with. A suite run stays
+    inside that suite; a run that did not start from a suite cannot adopt one.
+    `saved_task` is the single task a resumed run started with: it resumes that
+    task only, so one run identity never holds results for two tasks.
+    """
+    if args.task and args.suite:
+        raise ValueError("use --task or --suite, not both.")
+    if args.suite and saved_suite != args.suite and (args.resume or saved_suite):
+        started = f"with suite {saved_suite!r}" if saved_suite else "without a suite"
+        raise ValueError(
+            f"cannot resume with --suite {args.suite!r}: the run was started {started}."
+        )
+    if saved_task:
+        if args.task and args.task != saved_task:
+            raise ValueError(
+                f"cannot resume with --task {args.task!r}: "
+                f"the run was started with --task {saved_task!r}."
+            )
+        return [saved_task]
+    suite = args.suite or saved_suite
+    members = _suite_task_ids(suite) if suite else []  # verifies every pin
+    if args.task:
+        if saved_suite and args.task not in members:
+            raise ValueError(f"{args.task!r} is not in suite {saved_suite!r}.")
+        return [args.task]
+    if suite:
+        return members
+    raise ValueError(
+        "specify --task <id> or --suite <name> "
+        f"(available suites: {', '.join(available_suites()) or 'none'})."
+    )
 
 
 def main() -> int:
@@ -1642,6 +1727,12 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--task", help="run a single task by ID")
+    p.add_argument(
+        "--suite",
+        help="run every task of a named suite (bench/suites/<name>.json); "
+        "required when --task is not given, so legacy and corrected task "
+        "versions are never evaluated together by accident",
+    )
     p.add_argument("--tag", help="label for the run output directory")
     p.add_argument(
         "--max-wall",
@@ -1670,6 +1761,14 @@ def main() -> int:
     p.add_argument("--run-dir", help="custom destination directory for this run")
     args = p.parse_args()
 
+    ids: list[str] = []
+    if not args.resume:  # fail before creating a run directory
+        try:
+            ids = _selected_task_ids(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
     run_dir, cfg, sampling = _resolve_run_dir_and_config(args, p)
 
     if cfg.get("strict_isolation") and not check_cgroup_v2():
@@ -1680,7 +1779,11 @@ def main() -> int:
         )
         return 1
 
-    ids = [args.task] if args.task else all_tasks()
+    try:
+        ids = ids or _selected_task_ids(args, cfg.get("suite", ""), cfg.get("task", ""))
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if not ids:
         print("no tasks found", file=sys.stderr)
         return 1

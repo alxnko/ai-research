@@ -27,7 +27,7 @@ versioned operations and are **not** part of ordinary verification.
 
 ## What is here
 
-`bench/` — an agentic coding benchmark. 24 hand-written tasks across backend,
+`bench/` — an agentic coding benchmark. 24 hand-written tasks (suite `v0.4`; corrected suite `v0.5`) across backend,
 debugging, devops, frontend, mobile and refactoring. Each task is a disposable
 repo with hidden tests, a golden solution, and a shell-only agent loop that
 runs under `bwrap` with no network and no access to the host home directory.
