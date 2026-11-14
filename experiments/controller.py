@@ -9,7 +9,6 @@ attempts through the existing `bench/bench.py` engine without touching it, and
 analyses the result with explicit handling of zero-success arms.
 
     uv run python -m experiments.controller check   MANIFEST
-    uv run python -m experiments.controller status  MANIFEST [--runs DIR]
     uv run python -m experiments.controller analyze MANIFEST [--runs DIR] [--json]
     uv run python -m experiments.controller plan    MANIFEST [--runs DIR]
     uv run python -m experiments.controller run     MANIFEST
@@ -22,10 +21,12 @@ non-zero while any attempt is missing, invalid or unexpected.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -37,7 +38,8 @@ from bench import bench as engine
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUITES = os.path.join(ROOT, "bench", "suites")
 REQUIRED_ROW = ("task", "passed", "run_successful", "total_wall_s", "tokens")
-QUARANTINE = (".partial", ".aborted-", ".invalid-")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_QUARANTINE = re.compile(r"(?P<task>.+)\.(partial|aborted-\d+|invalid-\d+)")
 
 # key -> expected type (unknown keys are rejected, so typos fail loudly)
 _TOP: dict[str, type] = {
@@ -101,7 +103,7 @@ def validate_manifest(m: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(m, dict):
         return ["manifest must be an object"]
-    required = set(_TOP) - {"aborted", "frozen", "provenance_file"}
+    required = set(_TOP) - {"aborted", "provenance_file"}  # frozen: fail closed
     for key in sorted(required - set(m)):
         errors.append(f"{key}: missing")
     for key in m:
@@ -123,24 +125,38 @@ def validate_manifest(m: Any) -> list[str]:
         items = m[field]
         if not items or len(set(items)) != len(items):
             errors.append(f"{field}: must be non-empty and unique")
-    if not all(isinstance(t, str) for t in m["tasks"]):
-        errors.append("tasks: must be strings")
+    if not all(isinstance(t, str) and _NAME.fullmatch(t) for t in m["tasks"]):
+        errors.append("tasks: must be plain names (letters, digits, . _ -)")
     if not all(isinstance(s, int) and not isinstance(s, bool) for s in m["seeds"]):
         errors.append("seeds: must be integers")
     if not m["arms"]:
         errors.append("arms: must not be empty")
     for name, arm in m["arms"].items():
+        if not _NAME.fullmatch(name):
+            errors.append(f"arms.{name}: must be a plain name")
         digest = arm.get("prompt_sha256") if isinstance(arm, dict) else None
         if not (isinstance(digest, str) and len(digest) == 64):
             errors.append(f"arms.{name}.prompt_sha256: must be a sha256 hex digest")
         extra = set(arm) - {"prompt_sha256", "launch"} if isinstance(arm, dict) else ()
         if extra:
             errors.append(f"arms.{name}: unknown keys {sorted(extra)}")
+        launch = arm.get("launch", []) if isinstance(arm, dict) else []
+        if not (isinstance(launch, list) and all(isinstance(a, str) for a in launch)):
+            errors.append(f"arms.{name}.launch: must be a list of strings")
     analysis = m["analysis"]
     if set(analysis) != {"control", "treatment", "min_ratio"}:
         errors.append("analysis: needs exactly control, treatment, min_ratio")
     elif not {analysis["control"], analysis["treatment"]} <= set(m["arms"]):
         errors.append("analysis: control/treatment must name arms")
+    elif analysis["control"] == analysis["treatment"]:
+        errors.append("analysis: control and treatment must differ")
+    ratio = analysis.get("min_ratio")
+    if not (
+        isinstance(ratio, int | float) and not isinstance(ratio, bool) and ratio > 0
+    ):
+        errors.append("analysis.min_ratio: must be a positive number")
+    if os.path.isabs(m["runs_dir"]) or ".." in m["runs_dir"].split("/"):
+        errors.append("runs_dir: must be a relative path inside the repository")
     return errors
 
 
@@ -154,7 +170,14 @@ def load_manifest(path: str) -> dict[str, Any]:
 
 
 def manifest_sha256(manifest: dict[str, Any]) -> str:
-    blob = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    """Hash of what defines the experiment; not of where or how it was launched
+    (interpreter paths, run directory, free-text notes)."""
+    ident = {k: v for k, v in manifest.items() if k not in ("aborted", "runs_dir")}
+    ident["arms"] = {
+        name: {"prompt_sha256": spec["prompt_sha256"]}
+        for name, spec in manifest["arms"].items()
+    }
+    blob = json.dumps(ident, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
@@ -225,6 +248,63 @@ def _read_json(path: str) -> Any:
         return json.load(f)
 
 
+def _same(a: Any, b: Any) -> bool:
+    """Equality that does not let 1 pass for True or 16384.0 for 16384."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def _sha256_file(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _file_names(manifest: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        "config.json",
+        "results.json",
+        manifest.get("provenance_file", "provenance.json"),
+    )
+
+
+def _binding_problems(
+    manifest: dict[str, Any], arm: str, seed: int, task: str, cell: str
+) -> list[str]:
+    """Bind the three record files to this attempt, so one cell's results cannot
+    be copied into another. New runs carry attempt.json (identity + file
+    hashes); a frozen record set may carry a SHA256SUMS in the runs directory."""
+    names = _file_names(manifest)
+    if not manifest.get("frozen"):
+        try:
+            att = _read_json(os.path.join(cell, "attempt.json"))
+            want = {
+                "attempt_id": attempt_id(manifest, arm, seed, task),
+                "manifest_sha256": manifest_sha256(manifest),
+            }
+            problems = [
+                f"attempt.json {k} differs" for k, v in want.items() if att.get(k) != v
+            ]
+            hashes = att.get("files", {})
+        except (OSError, ValueError, AttributeError) as exc:
+            return [f"attempt.json: unreadable ({type(exc).__name__})"]
+        return problems + [
+            f"{n} does not match its recorded hash"
+            for n in names
+            if hashes.get(n) != _sha256_file(os.path.join(cell, n))
+        ]
+    runs = os.path.dirname(os.path.dirname(os.path.dirname(cell)))
+    sums_path = os.path.join(runs, "SHA256SUMS")
+    if not os.path.exists(sums_path):
+        return []
+    with open(sums_path, encoding="utf-8") as f:
+        sums = dict(line.split("  ", 1)[::-1] for line in f.read().splitlines() if line)
+    prefix = f"{arm}/seed{seed}/{task}/"
+    return [
+        f"{n} is not covered by, or differs from, SHA256SUMS"
+        for n in names
+        if sums.get(prefix + n) != _sha256_file(os.path.join(cell, n))
+    ]
+
+
 def validate_attempt(
     manifest: dict[str, Any], arm: str, seed: int, task: str, cell: str
 ) -> list[str]:
@@ -232,81 +312,109 @@ def validate_attempt(
 
     Checks the record against the manifest: task fixture digest, model
     identity, prompt hash, settings, sampling seed and the exact bench
-    invocation, not merely that a results.json exists.
+    invocation, and binds the files to the attempt (hashes). A malformed
+    record is reported, never raised.
     """
-    problems: list[str] = []
-    provenance_name = manifest.get("provenance_file", "provenance.json")
+    names = _file_names(manifest)
+    problems = [
+        f"{n} is a symlink"
+        for n in (cell, *(os.path.join(cell, n) for n in names))
+        if os.path.islink(n)
+    ]
     docs: dict[str, Any] = {}
-    for name in ("config.json", "results.json", provenance_name):
+    for name in names:
         try:
             docs[name] = _read_json(os.path.join(cell, name))
         except (OSError, ValueError) as exc:
             problems.append(f"{name}: unreadable ({type(exc).__name__})")
     if problems:
         return problems
+    try:
+        return _check_records(manifest, arm, seed, task, docs) + _binding_problems(
+            manifest, arm, seed, task, cell
+        )
+    except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+        return [f"malformed record ({type(exc).__name__}: {exc})"]
+
+
+def _check_records(
+    manifest: dict[str, Any], arm: str, seed: int, task: str, docs: dict[str, Any]
+) -> list[str]:
+    problems: list[str] = []
 
     def want(ok: bool, text: str) -> None:
         if not ok:
             problems.append(text)
 
+    def is_count(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
     rows = docs["results.json"]
     row = rows[0] if isinstance(rows, list) and len(rows) == 1 else None
-    want(row is not None, "results.json must hold exactly one record")
-    settings, sampling = manifest["settings"], dict(manifest["settings"]["sampling"])
-    sampling_seed = {**sampling, "seed": seed}
+    want(isinstance(row, dict), "results.json must hold exactly one record")
+    settings = manifest["settings"]
+    sampling_seed = {**settings["sampling"], "seed": seed}
     if isinstance(row, dict):
         missing = [k for k in REQUIRED_ROW if k not in row]
         want(not missing, f"results.json missing keys {missing}")
+        pin = _suite_pins(manifest).get(task)
+        want(pin is not None, f"task {task!r} is not in the suite")
         want(row.get("task") == task, f"results task {row.get('task')!r} != {task!r}")
         want(
-            row.get("task_digest") == _suite_pins(manifest).get(task),
+            row.get("task_digest") == pin,
             "task fixture digest differs from the suite pin",
         )
+        for flag in ("run_successful", "passed"):
+            want(isinstance(row.get(flag), bool), f"{flag} must be a boolean")
         want(
-            isinstance(row.get("run_successful"), bool),
-            "run_successful must be a boolean",
-        )
-        want(
-            row.get("strict_isolation") == settings["strict_isolation"],
+            _same(row.get("strict_isolation"), settings["strict_isolation"]),
             "strict_isolation differs from the manifest",
         )
         want(row.get("actuator") == settings["actuator"], "actuator differs")
-        want(row.get("sampling") == sampling_seed, "sampling differs from manifest")
         want(
-            isinstance(row.get("total_wall_s"), int | float)
-            and not isinstance(row.get("total_wall_s"), bool)
-            and row["total_wall_s"] >= 0,
-            "total_wall_s must be a non-negative number",
+            _same(row.get("sampling"), sampling_seed), "sampling differs from manifest"
         )
+        wall = row.get("total_wall_s")
+        want(
+            isinstance(wall, int | float)
+            and not isinstance(wall, bool)
+            and math.isfinite(wall)
+            and wall >= 0,
+            "total_wall_s must be a finite non-negative number",
+        )
+        for counter in ("tokens", "invalid_actions"):
+            want(
+                row.get(counter) is None or is_count(row[counter]),
+                f"{counter} must be a non-negative integer",
+            )
     config = docs["config.json"]
     for key in ("ctx", "ngpu", "steps", "max_wall", "actuator", "strict_isolation"):
-        want(config.get(key) == settings[key], f"config.{key} differs from manifest")
+        want(
+            _same(config.get(key), settings[key]), f"config.{key} differs from manifest"
+        )
     want(config.get("model") == manifest["model"]["tag"], "config.model differs")
     want(config.get("task") == task, "config.task differs")
-    want(config.get("sampling") == sampling_seed, "config.sampling differs")
+    want(_same(config.get("sampling"), sampling_seed), "config.sampling differs")
 
-    prov = docs[provenance_name]
-    arm_spec = manifest["arms"][arm]
+    prov = docs[_file_names(manifest)[2]]
     bench = manifest["benchmark"]
+    want(prov.get("experiment") == manifest["experiment"], "experiment id differs")
     want(prov.get("policy") == arm, f"policy {prov.get('policy')!r} != arm {arm!r}")
     want(
-        prov.get("prompt_sha256") == arm_spec["prompt_sha256"],
+        prov.get("prompt_sha256") == manifest["arms"][arm]["prompt_sha256"],
         "prompt hash differs from the arm's registered prompt",
     )
     want(prov.get("benchmark_tag") == bench["tag"], "benchmark tag differs")
     want(prov.get("benchmark_core_commit") == bench["commit"], "core commit differs")
-    fingerprint = prov.get("model_fingerprint") or {}
+    fingerprint = prov.get("model_fingerprint")
     for key in ("manifest_digest", "config_digest", "weights_digest"):
-        want(fingerprint.get(key) == manifest["model"][key], f"model {key} differs")
+        got = fingerprint.get(key) if isinstance(fingerprint, dict) else None
+        want(got == manifest["model"][key], f"model {key} differs")
     want(
         prov.get("benchmark_argv") == bench_argv(manifest, seed, task),
         "recorded bench invocation differs from the manifest's",
     )
     return problems
-
-
-def _is_quarantine(name: str) -> bool:
-    return any(mark in name for mark in QUARANTINE)
 
 
 def scan(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
@@ -315,7 +423,12 @@ def scan(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
     for arm, seed, task in attempts(manifest):
         cell = cell_dir(runs, arm, seed, task)
         if not os.path.exists(os.path.join(cell, "results.json")):
-            state: dict[str, Any] = {"state": "missing", "problems": []}
+            state: dict[str, Any] = {
+                "state": "missing",
+                "problems": [],
+                # a directory without a result: running would burn an attempt
+                "stale_dir": os.path.lexists(cell),
+            }
         else:
             problems = validate_attempt(manifest, arm, seed, task, cell)
             state = {"state": "invalid" if problems else "valid", "problems": problems}
@@ -330,13 +443,18 @@ def scan(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
             continue
         for seed_name in sorted(os.listdir(arm_dir)):
             seed_dir = os.path.join(arm_dir, seed_name)
-            if not (seed_name.startswith("seed") and os.path.isdir(seed_dir)):
+            if not (re.fullmatch(r"seed\d+", seed_name) and os.path.isdir(seed_dir)):
+                unexpected.append(seed_dir)
                 continue
             for name in sorted(os.listdir(seed_dir)):
                 path = os.path.join(seed_dir, name)
                 if path in expected:
                     continue
-                (quarantined if _is_quarantine(name) else unexpected).append(path)
+                held = _QUARANTINE.fullmatch(name)
+                if held and held["task"] in manifest["tasks"]:
+                    quarantined.append(path)
+                else:
+                    unexpected.append(path)
     return {"cells": cells, "unexpected": unexpected, "quarantined": quarantined}
 
 
@@ -363,7 +481,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "success_rate": len(ok) / len(rows) if rows else None,
         "wilson95": wilson(len(ok), len(rows)),
         "total_wall_s": round(wall, 1),
-        # zero successes is a measured 0.0 tasks/h, never a missing value
+        # zero successes over positive wall time is a measured 0.0 tasks/h
         "verified_tasks_per_hour": round(3600 * len(ok) / wall, 2) if wall else None,
         "median_wall_s": round(statistics.median(walls), 1) if walls else None,
         "p95_wall_s": (
@@ -396,10 +514,19 @@ def decide(
         return {
             "status": "ratio_undefined",
             "met": None,
+            # A deliberate, conservative choice: the protocol does not say whether
+            # an infinite ratio counts as a win, so the rule is not evaluated.
             "reason": f"control has 0 verified successes (treatment {t['successes']}); "
             "the throughput ratio is undefined, so the rule is not evaluated",
         }
-    ratio = t["verified_tasks_per_hour"] / c["verified_tasks_per_hour"]
+    c_rate, t_rate = c["verified_tasks_per_hour"], t["verified_tasks_per_hour"]
+    if not c_rate or t_rate is None:
+        return {
+            "status": "ratio_undefined",
+            "met": None,
+            "reason": "an arm has no recorded wall time, so throughput is undefined",
+        }
+    ratio = t_rate / c_rate
     met = (
         ratio >= spec["min_ratio"]
         and t["successes"] >= c["successes"]
@@ -448,6 +575,9 @@ def analyze(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
             for key, info in cells.items()
             if info["problems"]
         },
+        "stale_dirs": [
+            "/".join(map(str, k)) for k, i in cells.items() if i.get("stale_dir")
+        ],
         "missing": [
             "/".join(map(str, k)) for k, i in cells.items() if i["state"] == "missing"
         ],
@@ -476,7 +606,7 @@ def preflight(manifest: dict[str, Any], *, live: bool = False) -> list[str]:
             problems.append(f"task {task!r} fixtures differ from the suite pin")
     if live:
         fingerprint = engine.model_fingerprint(manifest["model"]["tag"])
-        for key in ("manifest_digest", "weights_digest"):
+        for key in ("manifest_digest", "config_digest", "weights_digest"):
             if fingerprint.get(key) != manifest["model"][key]:
                 problems.append(f"model {key} differs from the manifest")
     return problems
@@ -503,21 +633,70 @@ def promote(
         os.rename(stage, _next_free(cell, ".invalid-"))
         return problems
     os.rename(stage, cell)  # one directory rename: the cell is complete or absent
+    fd = os.open(os.path.dirname(cell), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return []
+
+
+def _write_attempt(
+    manifest: dict[str, Any],
+    key: tuple[str, int, str],
+    stage: str,
+    *,
+    durable: bool = True,
+) -> None:
+    """attempt.json: identity plus the hash of each record file, durably."""
+    arm, seed, task = key
+    doc = {
+        "attempt_id": attempt_id(manifest, arm, seed, task),
+        "manifest_sha256": manifest_sha256(manifest),
+        "files": {
+            n: _sha256_file(os.path.join(stage, n)) for n in _file_names(manifest)
+        },
+    }
+    with open(os.path.join(stage, "attempt.json"), "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+        if durable:
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _preflight_run(manifest: dict[str, Any], runs: str, live: bool) -> list[str]:
+    problems = preflight(manifest, live=live)
+    state = scan(manifest, runs)
+    for key, info in state["cells"].items():
+        name = "/".join(map(str, key))
+        if info["state"] == "invalid":
+            problems.append(f"{name}: " + "; ".join(info["problems"]))
+        elif info.get("stale_dir"):
+            problems.append(f"{name}: directory exists without a result; resolve it")
+    problems += [f"unexpected: {p}" for p in state["unexpected"]]
+    # A leftover staging or quarantine dir means an earlier attempt did not finish
+    # or failed validation. Re-running would silently re-roll it (protocol rules
+    # 4 and 5), so a person must decide: move it aside, then run again.
+    problems += [f"unresolved earlier attempt: {p}" for p in state["quarantined"]]
+    return problems
 
 
 def run(manifest: dict[str, Any], runs: str, *, live: bool = True) -> int:
     if manifest.get("frozen"):
         print(f"{manifest['experiment']} is frozen: analysis only.", file=sys.stderr)
         return 2
-    problems = preflight(manifest, live=live)
-    state = scan(manifest, runs)
-    for key, info in state["cells"].items():
-        if info["state"] == "invalid":
-            problems.append(
-                f"{'/'.join(map(str, key))}: " + "; ".join(info["problems"])
-            )
-    problems += [f"unexpected: {p}" for p in state["unexpected"]]
+    os.makedirs(runs, exist_ok=True)
+    with open(os.path.join(runs, ".controller.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another controller is running on these records", file=sys.stderr)
+            return 2
+        return _run_locked(manifest, runs, live)
+
+
+def _run_locked(manifest: dict[str, Any], runs: str, live: bool) -> int:
+    problems = _preflight_run(manifest, runs, live)
     if problems:
         print("preflight failed:\n  " + "\n  ".join(problems), file=sys.stderr)
         return 2
@@ -527,13 +706,8 @@ def run(manifest: dict[str, Any], runs: str, *, live: bool = True) -> int:
             print(f"SKIP {arm} seed{seed} {task} (valid)")
             continue
         stage = cell + ".partial"
-        if os.path.exists(stage):  # a crashed earlier attempt: keep it as evidence
-            os.rename(stage, _next_free(cell, ".aborted-"))
         os.makedirs(os.path.dirname(cell), exist_ok=True)
-        launch = manifest["arms"][arm].get("launch") or [
-            sys.executable,
-            os.path.join(ROOT, "bench", "bench.py"),
-        ]
+        launch = manifest["arms"][arm]["launch"]
         subprocess.run(
             [*launch, "--run-dir", stage, *bench_argv(manifest, seed, task)],
             cwd=ROOT,
@@ -542,14 +716,10 @@ def run(manifest: dict[str, Any], runs: str, *, live: bool = True) -> int:
         if not os.path.isdir(stage):
             print(f"{arm} seed{seed} {task}: no output produced", file=sys.stderr)
             return 3
-        with open(os.path.join(stage, "attempt.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "attempt_id": attempt_id(manifest, arm, seed, task),
-                    "manifest_sha256": manifest_sha256(manifest),
-                },
-                f,
-            )
+        try:
+            _write_attempt(manifest, (arm, seed, task), stage)
+        except OSError as exc:  # missing record files: promote() will say which
+            print(f"{arm} seed{seed} {task}: attempt.json not written ({exc})")
         bad = promote(manifest, (arm, seed, task), stage, cell)
         if bad:
             print(f"HALT {arm} seed{seed} {task}: " + "; ".join(bad), file=sys.stderr)
@@ -574,6 +744,8 @@ def _print_report(report: dict[str, Any]) -> None:
         print(f"  INVALID {key}: {'; '.join(why)}")
     for path in report["unexpected"]:
         print(f"  UNEXPECTED {path}")
+    for path in report["quarantined"]:
+        print(f"  QUARANTINED {path} (earlier attempt kept as evidence)")
     for arm, d in report["arms"].items():
         lo, hi = d["wilson95"]
         rate = (d["success_rate"] or 0) * 100
@@ -590,9 +762,7 @@ def _print_report(report: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument(
-        "command", choices=("check", "status", "analyze", "plan", "run")
-    )
+    parser.add_argument("command", choices=("check", "analyze", "plan", "run"))
     parser.add_argument("manifest")
     parser.add_argument("--runs", help="records directory (default: manifest runs_dir)")
     parser.add_argument("--json", action="store_true")

@@ -42,23 +42,30 @@ hours or overwrite experiment records.
 `experiments/controller.py` derives the whole attempt matrix from one manifest
 (`experiments/manifests/`) and enforces it; offline, no Ollama or GPU needed.
 
-- `check` (manifest vs suite pins), `status`/`analyze` (every recorded attempt
-  is validated against the manifest: fixture digest, model identity, prompt
-  hash, settings, seed and exact bench invocation), `plan`, and `run`.
+- `check` (manifest vs suite pins), `analyze`, `plan`, and `run`. `analyze`
+  validates every recorded attempt against the manifest (fixture digest, model
+  identity, prompt hash, settings, seed, exact bench invocation), binds the
+  record files to their cell by hash (`attempt.json` for new runs, a
+  `SHA256SUMS` for a frozen record set), and reports malformed records as
+  invalid instead of crashing.
 - `analyze` exits non-zero while any attempt is missing, invalid or unexpected
-  and withholds the decision; a zero-success arm is reported as
-  `no_success` (0.0 tasks/h), never as a missing value. A control with no
-  successes makes the ratio undefined and says so.
-- `run` stages each attempt in `<cell>.partial`, validates it, then promotes it
-  with one rename. Invalid or interrupted attempts are kept as `.invalid-N` /
-  `.aborted-N`, never deleted or overwritten; a valid cell is never re-run.
+  and withholds the decision. A zero-success arm is `no_success` (0.0 tasks/h).
+  If control has no successes the ratio is undefined and the rule is not
+  evaluated (a deliberate, conservative reading; the protocol is silent).
+- `run` takes an exclusive lock, stages each attempt in `<cell>.partial`,
+  validates it, then promotes it with one rename. Invalid or interrupted
+  attempts stay as `.invalid-N` / `.partial`, and the next `run` refuses until a
+  person moves them aside, so a failed attempt is never silently re-rolled.
   Each arm needs a `launch` entry that writes the provenance file (as
   `exp2_entry` does); plain `bench.py` writes none and is refused.
 - `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).
   `experiments/exp2_records/` holds byte copies of its 36 `config.json`,
   `exp2_policy.json` and `results.json` (hashes in `SHA256SUMS`; `env.json` and
   transcripts stay in the ignored `runs/`). Tests reproduce 6/18 vs 9/18 and
-  1.51x from them; with `runs/exp2` present they also check the copies match.
+  1.51x from them; with `runs/exp2` (or `EXP2_RUNS`) present they also check the
+  copies match the originals, otherwise that check reports SKIPPED.
+- Limits: `run` has not been exercised against a live model; the decision rule
+  compares only inference errors and timeouts, as the protocol words it.
 
 ## Harness and scorer changes
 

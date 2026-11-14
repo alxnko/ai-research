@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import fcntl
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import tempfile
 import textwrap
 import unittest
 from typing import Any
+from unittest import mock
 
 from experiments import analyze_exp2, controller
 
@@ -37,7 +39,9 @@ def manifest() -> dict[str, Any]:
 def edit(path: str, change) -> None:
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
-    doc = change(doc) or doc
+    replaced = change(doc)
+    if isinstance(replaced, dict | list):  # a change may swap the whole document
+        doc = replaced
     with open(path, "w", encoding="utf-8") as f:
         json.dump(doc, f)
 
@@ -48,13 +52,29 @@ class Scratch(unittest.TestCase):
     def setUp(self) -> None:
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(contextlib.redirect_stderr(io.StringIO()))
-        self.tmp = tempfile.mkdtemp(prefix="controller-test-", dir="/var/tmp")
+        self.tmp = tempfile.mkdtemp(
+            prefix="controller-test-",
+            dir="/var/tmp" if os.path.isdir("/var/tmp") else None,
+        )
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.runs = os.path.join(self.tmp, "runs")
         shutil.copytree(RECORDS, self.runs)
 
     def cell(self, key: Key = CELL) -> str:
         return controller.cell_dir(self.runs, *key)
+
+    def rewrite(self, key: Key, name: str, change) -> None:
+        """Edit a record file and re-bless it in SHA256SUMS (a deliberate,
+        internally consistent edit; the binding tests tamper without this)."""
+        path = os.path.join(self.cell(key), name)
+        edit(path, change)
+        sums = os.path.join(self.runs, "SHA256SUMS")
+        with open(sums, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        rel = f"{key[0]}/seed{key[1]}/{key[2]}/{name}"
+        digest = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+        lines = [f"{digest}  {rel}" if ln.endswith("  " + rel) else ln for ln in lines]
+        pathlib.Path(sums).write_text("\n".join(lines) + "\n")
 
 
 class TestReproduction(Scratch):
@@ -131,6 +151,13 @@ class TestReproduction(Scratch):
         self.assertNotEqual(
             controller.attempt_id(m, *CELL), controller.attempt_id(changed, *CELL)
         )
+        moved = copy.deepcopy(m)
+        moved["arms"]["control"]["launch"] = ["/elsewhere/python"]
+        moved["aborted"] = []
+        moved["runs_dir"] = "runs/other"
+        self.assertEqual(
+            controller.attempt_id(m, *CELL), controller.attempt_id(moved, *CELL)
+        )
         order = list(controller.attempts(m))
         self.assertEqual(order[0], CELL)
         self.assertEqual(order[18][0], "verification")
@@ -165,6 +192,14 @@ class TestManifestSchema(unittest.TestCase):
             "analysis names no arm": setpath(["analysis", "control"], "nope"),
             "wrong schema": setpath(["schema"], 2),
             "missing digest": setpath(["model", "weights_digest"], None),
+            "frozen not stated": drop("frozen"),
+            "min_ratio as text": setpath(["analysis", "min_ratio"], "1.25"),
+            "min_ratio zero": setpath(["analysis", "min_ratio"], 0),
+            "same control and treatment": setpath(["analysis", "treatment"], "control"),
+            "path traversal in task": setpath(["tasks"], ["../../x"]),
+            "absolute runs_dir": setpath(["runs_dir"], "/etc"),
+            "launch not a list": setpath(["arms", "control", "launch"], "python"),
+            "float seed": setpath(["seeds"], [42.5]),
         }
         for label, change in defects.items():
             m = copy.deepcopy(manifest())
@@ -210,6 +245,39 @@ class TestProvenance(Scratch):
                 results,
                 lambda d: d[0]["sampling"].update(temperature=0.7),
             ),
+            "other experiment": (policy, lambda d: d.update(experiment="EXP-9")),
+            "other core commit": (
+                policy,
+                lambda d: d.update(benchmark_core_commit="0"),
+            ),
+            "fingerprint not an object": (
+                policy,
+                lambda d: d.update(model_fingerprint="sha256:d8b0"),
+            ),
+            "config is a list": (config, lambda _d: [1]),
+            "results rows are lists": (results, lambda d: d.__setitem__(0, [1])),
+            "missing required key": (results, lambda d: d[0].pop("tokens")),
+            "other actuator": (results, lambda d: d[0].update(actuator="text")),
+            "tokens as text": (results, lambda d: d[0].update(tokens="93812")),
+            "invalid actions negative": (
+                results,
+                lambda d: d[0].update(invalid_actions=-1),
+            ),
+            "infinite wall time": (
+                results,
+                lambda d: d[0].update(total_wall_s=float("inf")),
+            ),
+            "nan wall time": (
+                results,
+                lambda d: d[0].update(total_wall_s=float("nan")),
+            ),
+            "passed not boolean": (results, lambda d: d[0].update(passed="yes")),
+            "1 for True": (results, lambda d: d[0].update(strict_isolation=1)),
+            "float for int": (config, lambda d: d.update(ctx=16384.0)),
+            "other task in config": (
+                config,
+                lambda d: d.update(task="refactor-parser"),
+            ),
             "other seed": (config, lambda d: d["sampling"].update(seed=43)),
             "other model tag": (config, lambda d: d.update(model="qwen3.5:4b")),
             "other budget": (config, lambda d: d.update(max_wall=1200)),
@@ -218,9 +286,18 @@ class TestProvenance(Scratch):
             scratch = os.path.join(self.tmp, "twin")
             shutil.rmtree(scratch, ignore_errors=True)
             shutil.copytree(self.cell(), scratch)
-            edit(os.path.join(scratch, name), change)
+            edit(os.path.join(scratch, name), change)  # defect: may replace the doc
             found = controller.validate_attempt(manifest(), *CELL, scratch)
             self.assertTrue(found, f"{label} was accepted")
+
+    def test_task_absent_from_the_suite_is_rejected(self):
+        edit(
+            os.path.join(self.cell(), "results.json"),
+            lambda d: d[0].pop("task_digest"),
+        )
+        with mock.patch.object(controller, "_suite_pins", lambda _m: {}):
+            found = controller.validate_attempt(manifest(), *CELL, self.cell())
+        self.assertTrue(any("not in the suite" in p for p in found), found)
 
     def test_missing_or_unreadable_files_are_detected(self):
         os.remove(os.path.join(self.cell(), "exp2_policy.json"))
@@ -270,8 +347,9 @@ class TestZeroSuccess(Scratch):
         for _, seed, task in (
             k for k in controller.attempts(manifest()) if k[0] == arm
         ):
-            edit(
-                os.path.join(self.cell((arm, seed, task)), "results.json"),
+            self.rewrite(
+                (arm, seed, task),
+                "results.json",
                 lambda d: d[0].update(run_successful=False, passed=False),
             )
 
@@ -297,6 +375,134 @@ class TestZeroSuccess(Scratch):
         report = controller.analyze(manifest(), self.runs)
         self.assertEqual(report["decision"]["status"], "inconclusive")
         self.assertTrue(report["complete"])
+
+
+class TestBinding(Scratch):
+    """A record cannot be moved between cells or edited after the fact."""
+
+    def test_results_copied_from_another_arm_are_rejected(self):
+        other = ("verification", 42, "backend-auth-token")
+        shutil.copyfile(
+            os.path.join(self.cell(other), "results.json"),
+            os.path.join(self.cell(), "results.json"),
+        )
+        found = controller.validate_attempt(manifest(), *CELL, self.cell())
+        self.assertTrue(any("SHA256SUMS" in p for p in found), found)
+        self.assertFalse(controller.analyze(manifest(), self.runs)["complete"])
+
+    def test_edit_after_promotion_is_rejected_for_new_runs(self):
+        m = copy.deepcopy(manifest())
+        m["frozen"] = False
+        os.remove(os.path.join(self.runs, "SHA256SUMS"))
+        controller._write_attempt(m, CELL, self.cell(), durable=False)
+        self.assertEqual(controller.validate_attempt(m, *CELL, self.cell()), [])
+        edit(
+            os.path.join(self.cell(), "results.json"),
+            lambda d: d[0].update(total_wall_s=1.0),
+        )
+        found = controller.validate_attempt(m, *CELL, self.cell())
+        self.assertTrue(any("recorded hash" in p for p in found), found)
+
+    def test_new_run_without_attempt_json_is_rejected(self):
+        m = copy.deepcopy(manifest())
+        m["frozen"] = False
+        found = controller.validate_attempt(m, *CELL, self.cell())
+        self.assertTrue(any("attempt.json" in p for p in found), found)
+
+    def test_attempt_json_of_another_cell_is_rejected(self):
+        m = copy.deepcopy(manifest())
+        m["frozen"] = False
+        os.remove(os.path.join(self.runs, "SHA256SUMS"))
+        other = ("control", 43, "backend-auth-token")
+        controller._write_attempt(m, other, self.cell(other), durable=False)
+        shutil.copyfile(
+            os.path.join(self.cell(other), "attempt.json"),
+            os.path.join(self.cell(), "attempt.json"),
+        )
+        found = controller.validate_attempt(m, *CELL, self.cell())
+        self.assertTrue(any("attempt_id" in p for p in found), found)
+
+    def test_symlinked_records_are_rejected(self):
+        real = os.path.join(self.tmp, "elsewhere.json")
+        shutil.copyfile(os.path.join(self.cell(), "results.json"), real)
+        os.remove(os.path.join(self.cell(), "results.json"))
+        os.symlink(real, os.path.join(self.cell(), "results.json"))
+        found = controller.validate_attempt(manifest(), *CELL, self.cell())
+        self.assertTrue(any("symlink" in p for p in found), found)
+
+
+class TestDecisionRule(unittest.TestCase):
+    """Each condition of the registered rule is decisive on its own."""
+
+    @staticmethod
+    def stats(successes, rate, errors=0, timeouts=0):
+        return {
+            "successes": successes,
+            "verified_tasks_per_hour": rate,
+            "inference_errors": errors,
+            "timeouts": timeouts,
+        }
+
+    def decide(self, control, treatment):
+        return controller.decide(
+            manifest(), {"control": control, "verification": treatment}
+        )
+
+    def test_boundaries(self):
+        base = self.stats(6, 20.0)
+        cases = {
+            "exactly 1.25x": (self.stats(6, 25.0), True),
+            "just below 1.25x": (self.stats(6, 24.9), False),
+            "fewer successes": (self.stats(5, 40.0), False),
+            "equal successes": (self.stats(6, 40.0), True),
+            "more inference errors": (self.stats(9, 40.0, errors=1), False),
+            "more timeouts": (self.stats(9, 40.0, timeouts=1), False),
+        }
+        for label, (treatment, met) in cases.items():
+            result = self.decide(base, treatment)
+            self.assertEqual(result["status"], "evaluated", label)
+            self.assertIs(result["met"], met, label)
+        # errors/timeouts equal to control's are not a regression
+        both = self.decide(self.stats(6, 20.0, 1, 1), self.stats(9, 40.0, 1, 1))
+        self.assertIs(both["met"], True)
+
+    def test_zero_recorded_wall_time_is_reported_not_raised(self):
+        for control, treatment in [
+            (self.stats(3, None), self.stats(3, 10.0)),
+            (self.stats(3, 10.0), self.stats(3, None)),
+            (self.stats(3, 10.0), self.stats(0, None)),
+        ]:
+            result = self.decide(control, treatment)
+            self.assertEqual(result["status"], "ratio_undefined")
+            self.assertIsNone(result["met"])
+
+    def test_summarize_zero_wall(self):
+        row = {"run_successful": True, "total_wall_s": 0, "tokens": 1}
+        self.assertIsNone(controller.summarize([row])["verified_tasks_per_hour"])
+        failed = {"run_successful": False, "total_wall_s": 10, "tokens": 1}
+        self.assertEqual(controller.summarize([failed])["verified_tasks_per_hour"], 0.0)
+
+
+class TestScanStrictness(Scratch):
+    def test_stray_quarantine_lookalike_is_unexpected(self):
+        stray = os.path.join(self.runs, "control", "seed42", "new-task.partial")
+        os.makedirs(stray)
+        report = controller.analyze(manifest(), self.runs)
+        self.assertEqual(report["unexpected"], [stray])
+        self.assertFalse(report["complete"])
+
+    def test_stray_entries_inside_an_arm_are_unexpected(self):
+        os.makedirs(os.path.join(self.runs, "control", "scratch"))
+        report = controller.analyze(manifest(), self.runs)
+        self.assertFalse(report["complete"])
+        self.assertEqual(len(report["unexpected"]), 1)
+
+    def test_quarantined_attempts_are_listed_in_the_report(self):
+        os.makedirs(self.cell() + ".invalid-1")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            controller.main(["analyze", MANIFEST, "--runs", self.runs])
+        self.assertIn("QUARANTINED", out.getvalue())
 
 
 FAKE_LAUNCHER = textwrap.dedent(
@@ -327,6 +533,11 @@ class TestRun(Scratch):
         m["frozen"] = False
         for arm in m["arms"]:
             m["arms"][arm]["launch"] = [sys.executable, script, arm, RECORDS, mode]
+        # new runs bind by attempt.json, not by a SHA256SUMS
+        pathlib.Path(self.runs, "SHA256SUMS").unlink(missing_ok=True)
+        for key in controller.attempts(m):
+            if os.path.isdir(self.cell(key)):
+                controller._write_attempt(m, key, self.cell(key), durable=False)
         return m
 
     def test_frozen_manifest_is_never_run(self):
@@ -348,23 +559,46 @@ class TestRun(Scratch):
             with open(os.path.join(self.cell(key), "results.json"), "rb") as f:
                 self.assertEqual(f.read(), blob, f"{key} was rewritten")
 
-    def test_crashed_attempt_is_kept_as_evidence(self):
+    def test_crashed_attempt_blocks_the_next_run_and_is_kept(self):
         last = ("verification", 44, "refactor-validators")
         shutil.rmtree(self.cell(last))
-        os.makedirs(self.cell(last) + ".partial")
-        with open(os.path.join(self.cell(last) + ".partial", "note"), "w") as f:
-            f.write("half done")
-        self.assertEqual(controller.run(self.runnable(), self.runs, live=False), 0)
-        kept = os.path.join(self.cell(last) + ".aborted-1", "note")
-        self.assertTrue(os.path.exists(kept))
+        stage = self.cell(last) + ".partial"
+        os.makedirs(stage)
+        pathlib.Path(stage, "note").write_text("half done")
+        m = self.runnable()
+        self.assertEqual(controller.run(m, self.runs, live=False), 2)  # no re-roll
+        self.assertEqual(pathlib.Path(stage, "note").read_text(), "half done")
+        self.assertFalse(os.path.exists(self.cell(last)))
+        os.rename(stage, os.path.join(self.tmp, "resolved"))  # a person resolves it
+        self.assertEqual(controller.run(m, self.runs, live=False), 0)
 
-    def test_invalid_attempt_halts_and_is_quarantined(self):
+    def test_invalid_attempt_halts_then_blocks_until_resolved(self):
         last = ("verification", 44, "refactor-validators")
         shutil.rmtree(self.cell(last))
         code = controller.run(self.runnable("bad-prompt"), self.runs, live=False)
         self.assertEqual(code, 3)
         self.assertFalse(os.path.exists(self.cell(last)))
         self.assertTrue(os.path.isdir(self.cell(last) + ".invalid-1"))
+        # re-running must not silently re-roll the failed attempt
+        self.assertEqual(controller.run(self.runnable(), self.runs, live=False), 2)
+        self.assertFalse(os.path.exists(self.cell(last)))
+
+    def test_directory_without_a_result_is_refused_before_launching(self):
+        last = ("verification", 44, "refactor-validators")
+        m = self.runnable()
+        os.remove(os.path.join(self.cell(last), "results.json"))
+        self.assertEqual(controller.run(m, self.runs, live=False), 2)
+        self.assertFalse(os.path.exists(self.cell(last) + ".invalid-1"))
+
+    def test_second_controller_is_locked_out(self):
+        m = self.runnable()
+        with open(os.path.join(self.runs, ".controller.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(controller.run(m, self.runs, live=False), 2)
+
+    def test_stray_entries_stop_a_run(self):
+        os.makedirs(os.path.join(self.runs, "control", "seed42", "extra-task"))
+        self.assertEqual(controller.run(self.runnable(), self.runs, live=False), 2)
 
     def test_existing_invalid_cell_stops_before_launching(self):
         edit(
@@ -394,6 +628,17 @@ class TestRun(Scratch):
         del m["arms"]["control"]["launch"]
         self.assertTrue(any("no launch entry" in p for p in controller.preflight(m)))
         self.assertEqual(controller.run(m, self.runs, live=False), 2)
+
+    def test_live_model_identity_is_checked_against_all_three_digests(self):
+        good = {k: v for k, v in manifest()["model"].items() if k.endswith("_digest")}
+        with mock.patch.object(controller.engine, "model_fingerprint", lambda _t: good):
+            self.assertEqual(controller.preflight(manifest(), live=True), [])
+        for key in good:
+            bad = {**good, key: "sha256:other"}
+            with mock.patch.object(
+                controller.engine, "model_fingerprint", lambda _t, bad=bad: bad
+            ):
+                self.assertTrue(controller.preflight(manifest(), live=True), key)
 
     def test_preflight_detects_fixture_drift(self):
         self.assertEqual(controller.preflight(manifest()), [])
