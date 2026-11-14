@@ -36,6 +36,8 @@ ignore = [
 "bench/telemetry.py" = ["PLR0913", "PLR0917", "PLR0912", "PLR0915"]
 # The arm wrapper validates the full invocation in one fail-closed block.
 "experiments/exp2_entry.py" = ["PLR0915"]
+# The manifest validator is one linear list of independent schema checks.
+"experiments/controller.py" = ["PLR0912", "PLR0915"]
 "bench/classifier.py" = ["PLR0913", "PLR0917", "PLR0912"]
 
 [tool.ty.environment]

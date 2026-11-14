@@ -1,0 +1,21 @@
+{
+  "model": "qwen3.5:4b-q4_K_M",
+  "ctx": 16384,
+  "ngpu": 99,
+  "steps": 20,
+  "repeat": 1,
+  "max_wall": 600,
+  "tag": "",
+  "task": "debugging-money-round",
+  "actuator": "native_tools",
+  "strict_isolation": true,
+  "sampling": {
+    "profile": "exp2-coding-v1",
+    "version": "v1",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "repeat_penalty": 1.0,
+    "seed": 44
+  }
+}

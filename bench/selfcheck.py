@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import http.server
+import io
 import json
 import multiprocessing as mp
 import os
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import unittest
 from typing import Any
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +49,7 @@ from bench.telemetry import (
     summarize_inference,
 )
 from bench.validator_selftest import validator_selftests
+from experiments import test_controller
 
 
 def parser_checks() -> list[tuple[str, str, str]]:
@@ -1887,6 +1890,20 @@ def check_task(
     return line, problems
 
 
+def controller_tests() -> list[tuple[str, str, str]]:
+    """Run the offline experiment-controller tests (experiments/test_controller.py)."""
+    stream = io.StringIO()
+    result = unittest.TextTestRunner(stream=stream, verbosity=0).run(
+        unittest.defaultTestLoader.loadTestsFromModule(test_controller)
+    )
+    for test, _reason in result.skipped:
+        print(f"SKIPPED (not verified): {test.id()}")
+    return [
+        ("controller", test.id(), trace)
+        for test, trace in [*result.failures, *result.errors]
+    ]
+
+
 def main() -> int:
     failures: list[tuple[str, str, str]] = []
 
@@ -1941,6 +1958,9 @@ def main() -> int:
 
     print("Running sandbox output symlink security tests...")
     failures.extend(sandbox_output_symlink_regression_test())
+
+    print("Running experiment controller tests (EXP-2 reproduced offline)...")
+    failures.extend(controller_tests())
 
     print("Running validator self-tests (each defect must be caught)...")
     failures.extend(validator_selftests(check_task))

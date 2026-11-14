@@ -1,0 +1,42 @@
+{
+  "benchmark_argv": [
+    "--model",
+    "qwen3.5:4b-q4_K_M",
+    "--actuator",
+    "native_tools",
+    "--task",
+    "refactor-validators",
+    "--ctx",
+    "16384",
+    "--ngpu",
+    "99",
+    "--steps",
+    "20",
+    "--max-wall",
+    "600",
+    "--strict-isolation",
+    "--sampling-profile",
+    "exp2-coding-v1",
+    "--temperature",
+    "0.6",
+    "--top-p",
+    "0.95",
+    "--top-k",
+    "20",
+    "--repeat-penalty",
+    "1.0",
+    "--seed",
+    "42"
+  ],
+  "benchmark_core_commit": "da36111",
+  "benchmark_tag": "v0.4",
+  "experiment": "EXP-2",
+  "model_fingerprint": {
+    "config_digest": "sha256:788a4d94bc3f431ac0cd067005be4b838a09330427962952420b05d10ecf84db",
+    "manifest_digest": "sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04",
+    "weights_bytes": 2648593216,
+    "weights_digest": "sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50"
+  },
+  "policy": "verification",
+  "prompt_sha256": "27a9d510628d668cf45f2281ca0c2105c8d9614523018027f1dc863747fb8d37"
+}

@@ -1,0 +1,91 @@
+[
+  {
+    "task": "refactor-validators",
+    "task_digest": "ba4669d7f63e4b0d525574c5c80015ffc7a62bd9956d80b024486461ebf22ecc",
+    "timestamp_start": 1794213708.6895554,
+    "passed": false,
+    "run_successful": false,
+    "verification_passed": false,
+    "inference_error": null,
+    "outcome": "hidden_test_failure",
+    "possible_cause": "unknown",
+    "cause_evidence": [
+      "verification exited with failure (======================================================================)"
+    ],
+    "symptoms": {
+      "output_limit_reached": false,
+      "context_capacity_reached": false,
+      "context_near_capacity": false,
+      "invalid_actions_detected": false,
+      "repeated_command_loop": false,
+      "no_files_modified": false,
+      "forbidden_files_modified": false,
+      "memory_limit_exceeded": false,
+      "timeout_exceeded": false,
+      "incomplete_stream": false,
+      "max_prompt_eval_tokens": 2297
+    },
+    "strict_isolation": true,
+    "actuator": "native_tools",
+    "sampling": {
+      "profile": "exp2-coding-v1",
+      "version": "v1",
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "repeat_penalty": 1.0,
+      "seed": 42
+    },
+    "steps": 5,
+    "model_turns": 5,
+    "commands_executed": 4,
+    "max_commands": 20,
+    "tokens": 8678,
+    "tokens_incomplete": false,
+    "agent_wall_s": 19.27,
+    "verification_wall_s": 0.11,
+    "total_wall_s": 19.38,
+    "wall_s": 19.38,
+    "peak_vram_mib": 5839,
+    "peak_device_vram_mib": 5839,
+    "peak_ollama_vram_mib": 4042,
+    "gpu_telemetry_status": "available",
+    "monitor_sample_count": 35,
+    "monitor_max_sample_gap_s": 0.5642,
+    "monitor_overhead_s": 1.7659,
+    "reported_vram_size_ratio": 1.0,
+    "runner": "llamacpp",
+    "tool_calls": 5,
+    "invalid_actions": 0,
+    "timed_out": false,
+    "changed_files": [
+      "validators.py"
+    ],
+    "added_files": [],
+    "removed_files": [],
+    "forbidden_files": [],
+    "inference_summary": {
+      "total_requests": 5,
+      "total_prompt_tokens": 7403,
+      "total_eval_tokens": 1275,
+      "total_tokens": 8678,
+      "mean_ttft_s": 0.1895,
+      "mean_decode_tokens_per_s": 70.89,
+      "mean_prompt_eval_tokens_per_s": 19539.2,
+      "token_weighted_decode_tokens_per_s": 70.79,
+      "token_weighted_prompt_eval_tokens_per_s": 12594.42,
+      "total_eval_duration_s": 18.0117,
+      "total_prompt_eval_duration_s": 0.5878,
+      "done_reasons": [
+        "stop",
+        "stop",
+        "stop",
+        "stop",
+        "stop"
+      ],
+      "max_prompt_tokens": 2297
+    },
+    "exit": "======================================================================",
+    "repeat": 0
+  }
+]

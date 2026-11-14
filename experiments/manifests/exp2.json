@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "experiment": "EXP-2",
+  "frozen": true,
+  "benchmark": {
+    "tag": "v0.4",
+    "commit": "da36111",
+    "suite": "v0.4"
+  },
+  "tasks": [
+    "backend-auth-token",
+    "backend-idempotency",
+    "debugging-off-by-one",
+    "debugging-money-round",
+    "refactor-parser",
+    "refactor-validators"
+  ],
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "arms": {
+    "control": {
+      "prompt_sha256": "e3e28dd726bf3ed6052fbfe84ae1e5d75dab360e784aabe7f9f974bc3ac8f073"
+    },
+    "verification": {
+      "prompt_sha256": "27a9d510628d668cf45f2281ca0c2105c8d9614523018027f1dc863747fb8d37"
+    }
+  },
+  "model": {
+    "manifest_digest": "sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04",
+    "config_digest": "sha256:788a4d94bc3f431ac0cd067005be4b838a09330427962952420b05d10ecf84db",
+    "weights_digest": "sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50",
+    "tag": "qwen3.5:4b-q4_K_M"
+  },
+  "settings": {
+    "actuator": "native_tools",
+    "ctx": 16384,
+    "ngpu": 99,
+    "steps": 20,
+    "max_wall": 600,
+    "strict_isolation": true,
+    "sampling": {
+      "profile": "exp2-coding-v1",
+      "version": "v1",
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "repeat_penalty": 1.0
+    }
+  },
+  "runs_dir": "runs/exp2",
+  "provenance_file": "exp2_policy.json",
+  "aborted": [
+    {
+      "arm": "control",
+      "seed": 42,
+      "task": "backend-auth-token",
+      "reason": "harness killed the background shell after ~90s; no results.json, rerun as the first attempt"
+    },
+    {
+      "arm": "control",
+      "seed": 42,
+      "task": "backend-idempotency",
+      "reason": "sweep stopped mid-attempt to add result validation to the runner; no results.json"
+    }
+  ],
+  "analysis": {
+    "control": "control",
+    "treatment": "verification",
+    "min_ratio": 1.25
+  },
+  "integrity": "experiments/exp2_records/SHA256SUMS"
+}
