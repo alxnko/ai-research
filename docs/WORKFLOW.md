@@ -45,8 +45,9 @@ hours or overwrite experiment records.
 - `check` (manifest vs suite pins), `analyze`, `plan`, and `run`. `analyze`
   validates every recorded attempt against the manifest (fixture digest, model
   identity, prompt hash, settings, seed, exact bench invocation), binds the
-  record files to their cell by hash (`attempt.json` for new runs, a
-  `SHA256SUMS` for a frozen record set), and reports malformed records as
+  record files to their cell by hash (`attempt.json` for new runs; a frozen
+  manifest names a committed `SHA256SUMS` via `integrity`, so even the original
+  `runs/exp2` is hash-checked), and reports malformed records as
   invalid instead of crashing.
 - `analyze` exits non-zero while any attempt is missing, invalid or unexpected
   and withholds the decision. A zero-success arm is `no_success` (0.0 tasks/h).
@@ -55,7 +56,9 @@ hours or overwrite experiment records.
 - `run` takes an exclusive lock, stages each attempt in `<cell>.partial`,
   validates it, then promotes it with one rename. Invalid or interrupted
   attempts stay as `.invalid-N` / `.partial`, and the next `run` refuses until a
-  person moves them aside, so a failed attempt is never silently re-rolled.
+  person files them under `<runs>/aborted/` (ignored by the matrix, kept as
+  evidence), so a failed attempt is never silently re-rolled. Only the manifest's
+  arm directories are policed; `aborted/`, `logs/` etc. beside them are not.
   Each arm needs a `launch` entry that writes the provenance file (as
   `exp2_entry` does); plain `bench.py` writes none and is refused.
 - `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).

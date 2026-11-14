@@ -54,6 +54,7 @@ _TOP: dict[str, type] = {
     "settings": dict,
     "runs_dir": str,
     "provenance_file": str,
+    "integrity": str,
     "aborted": list,
     "analysis": dict,
 }
@@ -103,7 +104,11 @@ def validate_manifest(m: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(m, dict):
         return ["manifest must be an object"]
-    required = set(_TOP) - {"aborted", "provenance_file"}  # frozen: fail closed
+    required = set(_TOP) - {
+        "aborted",
+        "provenance_file",
+        "integrity",
+    }  # frozen: fail closed
     for key in sorted(required - set(m)):
         errors.append(f"{key}: missing")
     for key in m:
@@ -155,8 +160,12 @@ def validate_manifest(m: Any) -> list[str]:
         isinstance(ratio, int | float) and not isinstance(ratio, bool) and ratio > 0
     ):
         errors.append("analysis.min_ratio: must be a positive number")
-    if os.path.isabs(m["runs_dir"]) or ".." in m["runs_dir"].split("/"):
-        errors.append("runs_dir: must be a relative path inside the repository")
+    for field in ("runs_dir", "integrity"):
+        path = m.get(field, "")
+        if os.path.isabs(path) or ".." in path.split("/"):
+            errors.append(f"{field}: must be a relative path inside the repository")
+    if m["frozen"] and not m.get("integrity"):
+        errors.append("integrity: a frozen manifest needs a SHA256SUMS of its records")
     return errors
 
 
@@ -291,15 +300,16 @@ def _binding_problems(
             for n in names
             if hashes.get(n) != _sha256_file(os.path.join(cell, n))
         ]
-    runs = os.path.dirname(os.path.dirname(os.path.dirname(cell)))
-    sums_path = os.path.join(runs, "SHA256SUMS")
-    if not os.path.exists(sums_path):
-        return []
-    with open(sums_path, encoding="utf-8") as f:
-        sums = dict(line.split("  ", 1)[::-1] for line in f.read().splitlines() if line)
+    try:
+        with open(os.path.join(ROOT, manifest["integrity"]), encoding="utf-8") as f:
+            sums = dict(
+                line.split("  ", 1)[::-1] for line in f.read().splitlines() if line
+            )
+    except (OSError, ValueError, KeyError) as exc:
+        return [f"integrity file unreadable ({type(exc).__name__})"]
     prefix = f"{arm}/seed{seed}/{task}/"
     return [
-        f"{n} is not covered by, or differs from, SHA256SUMS"
+        f"{n} is not covered by, or differs from, the integrity file"
         for n in names
         if sums.get(prefix + n) != _sha256_file(os.path.join(cell, n))
     ]
@@ -382,6 +392,16 @@ def _check_records(
             and wall >= 0,
             "total_wall_s must be a finite non-negative number",
         )
+        vram = row.get("peak_vram_mib")
+        want(
+            vram is None
+            or (
+                isinstance(vram, int | float)
+                and not isinstance(vram, bool)
+                and math.isfinite(vram)
+            ),
+            "peak_vram_mib must be a number",
+        )
         for counter in ("tokens", "invalid_actions"):
             want(
                 row.get(counter) is None or is_count(row[counter]),
@@ -437,7 +457,10 @@ def scan(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
     expected = {cell_dir(runs, *key) for key in cells}
     unexpected: list[str] = []
     quarantined: list[str] = []
-    for arm in sorted(os.listdir(runs)) if os.path.isdir(runs) else []:
+    # Only the manifest's arm directories are policed. Anything else beside them
+    # (aborted/, logs/, attempts.log) is the operator's: moving a failed attempt
+    # to <runs>/aborted/ keeps it as evidence without blocking the matrix.
+    for arm in manifest["arms"]:
         arm_dir = os.path.join(runs, arm)
         if not os.path.isdir(arm_dir):
             continue

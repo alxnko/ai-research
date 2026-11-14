@@ -59,6 +59,15 @@ class Scratch(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.runs = os.path.join(self.tmp, "runs")
         shutil.copytree(RECORDS, self.runs)
+        # Hash-bind against this test's own (editable) copy, not the committed one.
+        sums = os.path.join(self.runs, "SHA256SUMS")
+        real = globals()["manifest"]
+        self.enterContext(
+            mock.patch.dict(
+                globals(),
+                {"manifest": lambda: {**real(), "integrity": sums}},
+            )
+        )
 
     def cell(self, key: Key = CELL) -> str:
         return controller.cell_dir(self.runs, *key)
@@ -138,6 +147,10 @@ class TestReproduction(Scratch):
                 digest, rel = line.split("  ", 1)
                 with open(os.path.join(originals, rel), "rb") as g:
                     self.assertEqual(hashlib.sha256(g.read()).hexdigest(), digest, rel)
+        # the controller accepts the real directory itself (aborted/, logs/ and all)
+        report = controller.analyze(manifest(), originals)
+        self.assertTrue(report["complete"], report["unexpected"])
+        self.assertEqual(report["decision"]["ratio"], 1.51)
 
     def test_attempt_identities(self):
         m = manifest()
@@ -193,6 +206,8 @@ class TestManifestSchema(unittest.TestCase):
             "wrong schema": setpath(["schema"], 2),
             "missing digest": setpath(["model", "weights_digest"], None),
             "frozen not stated": drop("frozen"),
+            "frozen without integrity": drop("integrity"),
+            "absolute integrity path": setpath(["integrity"], "/etc/SHA256SUMS"),
             "min_ratio as text": setpath(["analysis", "min_ratio"], "1.25"),
             "min_ratio zero": setpath(["analysis", "min_ratio"], 0),
             "same control and treatment": setpath(["analysis", "treatment"], "control"),
@@ -259,6 +274,7 @@ class TestProvenance(Scratch):
             "missing required key": (results, lambda d: d[0].pop("tokens")),
             "other actuator": (results, lambda d: d[0].update(actuator="text")),
             "tokens as text": (results, lambda d: d[0].update(tokens="93812")),
+            "peak vram as text": (results, lambda d: d[0].update(peak_vram_mib="big")),
             "invalid actions negative": (
                 results,
                 lambda d: d[0].update(invalid_actions=-1),
@@ -283,12 +299,17 @@ class TestProvenance(Scratch):
             "other budget": (config, lambda d: d.update(max_wall=1200)),
         }
         for label, (name, change) in defects.items():
-            scratch = os.path.join(self.tmp, "twin")
-            shutil.rmtree(scratch, ignore_errors=True)
-            shutil.copytree(self.cell(), scratch)
-            edit(os.path.join(scratch, name), change)  # defect: may replace the doc
-            found = controller.validate_attempt(manifest(), *CELL, scratch)
+            # A fresh copy per defect, edited and re-blessed in the hash list, so
+            # only the content checks (not the hash binding) can reject it.
+            shutil.rmtree(self.runs)
+            shutil.copytree(RECORDS, self.runs)
+            self.assertEqual(self.problems(), [], label)
+            self.rewrite(CELL, name, change)
+            found = self.problems()
             self.assertTrue(found, f"{label} was accepted")
+            self.assertFalse(
+                any("integrity file" in p for p in found), f"{label}: {found}"
+            )
 
     def test_task_absent_from_the_suite_is_rejected(self):
         edit(
@@ -387,7 +408,7 @@ class TestBinding(Scratch):
             os.path.join(self.cell(), "results.json"),
         )
         found = controller.validate_attempt(manifest(), *CELL, self.cell())
-        self.assertTrue(any("SHA256SUMS" in p for p in found), found)
+        self.assertTrue(any("integrity file" in p for p in found), found)
         self.assertFalse(controller.analyze(manifest(), self.runs)["complete"])
 
     def test_edit_after_promotion_is_rejected_for_new_runs(self):
@@ -402,6 +423,14 @@ class TestBinding(Scratch):
         )
         found = controller.validate_attempt(m, *CELL, self.cell())
         self.assertTrue(any("recorded hash" in p for p in found), found)
+
+    def test_frozen_records_without_their_integrity_file_fail_closed(self):
+        m = {**manifest(), "integrity": os.path.join(self.tmp, "missing-sums")}
+        found = controller.validate_attempt(m, *CELL, self.cell())
+        self.assertTrue(any("integrity file" in p for p in found), found)
+        os.makedirs(os.path.join(self.tmp, "sums-dir"))
+        m["integrity"] = os.path.join(self.tmp, "sums-dir")
+        self.assertTrue(controller.validate_attempt(m, *CELL, self.cell()))
 
     def test_new_run_without_attempt_json_is_rejected(self):
         m = copy.deepcopy(manifest())
@@ -484,6 +513,16 @@ class TestDecisionRule(unittest.TestCase):
 
 
 class TestScanStrictness(Scratch):
+    def test_operator_directories_beside_the_arms_are_ignored(self):
+        # the real runs/exp2 holds aborted attempts, logs and a summary log
+        os.makedirs(os.path.join(self.runs, "aborted", "killed-seed42", "r0"))
+        os.makedirs(os.path.join(self.runs, "logs"))
+        pathlib.Path(self.runs, "logs", "a.log").write_text("x")
+        pathlib.Path(self.runs, "attempts.log").write_text("x")
+        report = controller.analyze(manifest(), self.runs)
+        self.assertTrue(report["complete"], report["unexpected"])
+        self.assertEqual(report["decision"]["status"], "evaluated")
+
     def test_stray_quarantine_lookalike_is_unexpected(self):
         stray = os.path.join(self.runs, "control", "seed42", "new-task.partial")
         os.makedirs(stray)
@@ -569,8 +608,13 @@ class TestRun(Scratch):
         self.assertEqual(controller.run(m, self.runs, live=False), 2)  # no re-roll
         self.assertEqual(pathlib.Path(stage, "note").read_text(), "half done")
         self.assertFalse(os.path.exists(self.cell(last)))
-        os.rename(stage, os.path.join(self.tmp, "resolved"))  # a person resolves it
+        # a person resolves it by filing it as evidence beside the matrix
+        kept = os.path.join(self.runs, "aborted", "verification-seed44-partial")
+        os.makedirs(os.path.dirname(kept))
+        os.rename(stage, kept)
         self.assertEqual(controller.run(m, self.runs, live=False), 0)
+        self.assertEqual(pathlib.Path(kept, "note").read_text(), "half done")
+        self.assertTrue(controller.analyze(m, self.runs)["complete"])
 
     def test_invalid_attempt_halts_then_blocks_until_resolved(self):
         last = ("verification", 44, "refactor-validators")

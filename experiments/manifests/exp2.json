@@ -70,5 +70,6 @@
     "control": "control",
     "treatment": "verification",
     "min_ratio": 1.25
-  }
+  },
+  "integrity": "experiments/exp2_records/SHA256SUMS"
 }
