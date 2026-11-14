@@ -46,6 +46,34 @@ def edit(path: str, change) -> None:
         json.dump(doc, f)
 
 
+SYSTEM_PIN, SOURCE_PIN = "2" * 64, "1" * 64
+
+
+def runnable_manifest() -> dict[str, Any]:
+    """The EXP-2 manifest as a runnable one (adds the launcher-era identity pins)."""
+    m = copy.deepcopy(manifest())
+    m["frozen"] = False
+    m["benchmark"] = {
+        **m["benchmark"],
+        "source_files": ["bench/bench.py"],
+        "source_sha256": SOURCE_PIN,
+    }
+    for arm in m["arms"].values():
+        arm["system_prompt_sha256"] = SYSTEM_PIN
+    return m
+
+
+def launcher_fields(m: dict[str, Any], key: tuple[str, int, str]) -> dict[str, Any]:
+    """What the generic launcher adds to a provenance record."""
+    return {
+        "system_prompt_sha256": SYSTEM_PIN,
+        "model_calls": 1,
+        "source_sha256": SOURCE_PIN,
+        "source_verification": "git+filesystem",
+        "attempt_id": controller.attempt_id(m, *key),
+    }
+
+
 class Scratch(unittest.TestCase):
     """A private copy of the EXP-2 records for each test."""
 
@@ -488,10 +516,16 @@ class TestBinding(Scratch):
         self.assertTrue(any("integrity file" in p for p in found), found)
         self.assertFalse(controller.analyze(manifest(), self.runs)["complete"])
 
+    def upgraded(self, m: dict[str, Any], key: Key) -> None:
+        edit(
+            os.path.join(self.cell(key), "exp2_policy.json"),
+            lambda d: d.update(launcher_fields(m, key)),
+        )
+
     def test_edit_after_promotion_is_rejected_for_new_runs(self):
-        m = copy.deepcopy(manifest())
-        m["frozen"] = False
+        m = runnable_manifest()
         os.remove(os.path.join(self.runs, "SHA256SUMS"))
+        self.upgraded(m, CELL)
         controller._write_attempt(m, CELL, self.cell(), durable=False)
         self.assertEqual(controller.validate_attempt(m, *CELL, self.cell()), [])
         edit(
@@ -510,16 +544,16 @@ class TestBinding(Scratch):
         self.assertTrue(controller.validate_attempt(m, *CELL, self.cell()))
 
     def test_new_run_without_attempt_json_is_rejected(self):
-        m = copy.deepcopy(manifest())
-        m["frozen"] = False
+        m = runnable_manifest()
         found = controller.validate_attempt(m, *CELL, self.cell())
         self.assertTrue(any("attempt.json" in p for p in found), found)
 
     def test_attempt_json_of_another_cell_is_rejected(self):
-        m = copy.deepcopy(manifest())
-        m["frozen"] = False
+        m = runnable_manifest()
         os.remove(os.path.join(self.runs, "SHA256SUMS"))
         other = ("control", 43, "backend-auth-token")
+        self.upgraded(m, CELL)
+        self.upgraded(m, other)
         controller._write_attempt(m, other, self.cell(other), durable=False)
         shutil.copyfile(
             os.path.join(self.cell(other), "attempt.json"),
@@ -535,6 +569,58 @@ class TestBinding(Scratch):
         os.symlink(real, os.path.join(self.cell(), "results.json"))
         found = controller.validate_attempt(manifest(), *CELL, self.cell())
         self.assertTrue(any("symlink" in p for p in found), found)
+
+
+class TestLauncherProvenance(Scratch):
+    """Records of runnable manifests must carry the launcher's observations."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.m = runnable_manifest()
+        os.remove(os.path.join(self.runs, "SHA256SUMS"))
+        edit(
+            os.path.join(self.cell(), "exp2_policy.json"),
+            lambda d: d.update(launcher_fields(self.m, CELL)),
+        )
+        self.bless()
+
+    def bless(self) -> None:
+        controller._write_attempt(self.m, CELL, self.cell(), durable=False)
+
+    def problems(self) -> list[str]:
+        return controller.validate_attempt(self.m, *CELL, self.cell())
+
+    def test_clean_launcher_record_is_valid(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_each_observation_defect_is_detected(self):
+        policy = os.path.join(self.cell(), "exp2_policy.json")
+        defects = {
+            "other system prompt observed": {"system_prompt_sha256": "3" * 64},
+            "no model call": {"model_calls": 0},
+            "model calls as text": {"model_calls": "1"},
+            "other source identity": {"source_sha256": "4" * 64},
+            "source not verified against the tag": {
+                "source_verification": "digest-only"
+            },
+            "another attempt's provenance": {"attempt_id": "0" * 16},
+        }
+        good = json.loads(pathlib.Path(policy).read_text())
+        for label, change in defects.items():
+            pathlib.Path(policy).write_text(json.dumps({**good, **change}))
+            self.bless()  # re-bless: only the content checks may reject it
+            found = self.problems()
+            self.assertTrue(found, f"{label} was accepted")
+            self.assertFalse(any("recorded hash" in p for p in found), label)
+        for key in ("system_prompt_sha256", "model_calls", "source_sha256"):
+            pathlib.Path(policy).write_text(
+                json.dumps({k: v for k, v in good.items() if k != key})
+            )
+            self.bless()
+            self.assertTrue(self.problems(), f"missing {key} was accepted")
+        pathlib.Path(policy).write_text(json.dumps(good))
+        self.bless()
+        self.assertEqual(self.problems(), [])
 
 
 class TestDecisionRule(unittest.TestCase):
@@ -647,17 +733,19 @@ class TestScanStrictness(Scratch):
 FAKE_LAUNCHER = textwrap.dedent(
     """
     import os, shutil, sys
-    arm, records, mode = sys.argv[1:4]
-    args = sys.argv[4:]
+    arm, records, mode, meta = sys.argv[1:5]
+    args = sys.argv[5:]
     stage = args[args.index("--run-dir") + 1]
     seed = args[args.index("--seed") + 1]
     task = args[args.index("--task") + 1]
     shutil.copytree(f"{records}/{arm}/seed{seed}/{task}", stage, dirs_exist_ok=True)
+    import json
+    p = os.path.join(stage, "exp2_policy.json")
+    d = json.load(open(p))
+    d.update(json.load(open(meta))[f"{arm}/{seed}/{task}"])
     if mode == "bad-prompt":
-        import json
-        p = os.path.join(stage, "exp2_policy.json")
-        d = json.load(open(p)); d["prompt_sha256"] = "0" * 64
-        json.dump(d, open(p, "w"))
+        d["prompt_sha256"] = "0" * 64
+    json.dump(d, open(p, "w"))
     sys.exit(1)  # a failed task exits non-zero by design
     """
 )
@@ -668,14 +756,33 @@ class TestRun(Scratch):
         script = os.path.join(self.tmp, "launcher.py")
         with open(script, "w") as f:
             f.write(FAKE_LAUNCHER)
-        m = copy.deepcopy(manifest())
-        m["frozen"] = False
+        m = runnable_manifest()
+        meta = os.path.join(self.tmp, "meta.json")
+        pathlib.Path(meta).write_text(
+            json.dumps(
+                {
+                    "/".join(map(str, key)): launcher_fields(m, key)
+                    for key in controller.attempts(m)
+                }
+            )
+        )
         for arm in m["arms"]:
-            m["arms"][arm]["launch"] = [sys.executable, script, arm, RECORDS, mode]
+            m["arms"][arm]["launch"] = [
+                sys.executable,
+                script,
+                arm,
+                RECORDS,
+                mode,
+                meta,
+            ]
         # new runs bind by attempt.json, not by a SHA256SUMS
         pathlib.Path(self.runs, "SHA256SUMS").unlink(missing_ok=True)
         for key in controller.attempts(m):
             if os.path.isdir(self.cell(key)):
+                edit(
+                    os.path.join(self.cell(key), "exp2_policy.json"),
+                    lambda d, key=key: d.update(launcher_fields(m, key)),
+                )
                 controller._write_attempt(m, key, self.cell(key), durable=False)
         return m
 
@@ -798,12 +905,18 @@ class TestRun(Scratch):
     def problems_of(self, cell: str) -> list[str]:
         return controller.validate_attempt(manifest(), *CELL, cell)
 
-    def test_arm_without_a_provenance_writing_entry_is_refused(self):
+    def test_arm_without_a_launcher_needs_the_manifest_path(self):
         m = self.runnable()
         self.assertEqual(controller.preflight(m), [])
         del m["arms"]["control"]["launch"]
-        self.assertTrue(any("no launch entry" in p for p in controller.preflight(m)))
+        # the generic launcher is started with the manifest's path; without it
+        # the arm has no way to write provenance, so nothing is launched
+        problems = controller._preflight_run(m, self.runs, False, "")
+        self.assertTrue(any("no launch entry" in p for p in problems), problems)
         self.assertEqual(controller.run(m, self.runs, live=False), 2)
+        self.assertEqual(
+            controller._preflight_run(m, self.runs, False, "/some/manifest.json"), []
+        )
 
     def test_live_model_identity_is_checked_against_all_three_digests(self):
         good = {k: v for k, v in manifest()["model"].items() if k.endswith("_digest")}
