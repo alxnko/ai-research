@@ -72,27 +72,45 @@ hours or overwrite experiment records.
   1.51x from them; with `runs/exp2` (or `EXP2_RUNS`) present they also check the
   copies match the originals, otherwise that check reports SKIPPED.
 - **Code identity (run-only).** A runnable manifest registers
-  `benchmark.tag`, the full `commit`, `source_files` (engine, classifier,
-  telemetry, package init) and `source_sha256` (digest over those files plus the
-  suite manifest); `python -m experiments.source_identity TAG SUITE FILES...`
-  computes them from the tag's objects. `verify` / `run` fail closed unless the
-  files on disk hash to that digest, each selected task matches its suite pin,
-  no source file is a symlink or missing, the tag resolves to the registered
-  commit, and each file and task is byte-identical to the object at that
-  commit. The checkout's HEAD is irrelevant (newer controller code may run a
-  frozen benchmark). `check`, `plan` and `analyze` stay offline and never need
-  the tag. Needs the tag: `git fetch --tags`.
-- **Generic launcher** (`experiments/launcher.py`) starts any arm without its
-  own `launch`. Before a model call it re-checks the bench arguments, the code
-  identity, that the loaded engine modules are the verified files, the model's
-  manifest/config/weights digests, and that the arm's prompt (engine base prompt
-  plus the manifest's `prompt_edit`, applied exactly once) hashes to the pinned
-  `prompt_sha256` and `system_prompt_sha256`. A failure leaves
-  `launch-refused.json` and exits 4 with the engine not started. Then it runs
-  the unchanged engine behind a recorder that hashes the system message of every
-  request that reaches the model call; only if every request carried the pinned
-  prompt (and at least one was made) does it write `provenance.json`. Otherwise
-  `launch-failed.json` is written and the attempt is quarantined.
+  `benchmark.tag` (an *annotated* tag), the full `commit`, `source_files` (at
+  least `bench/__init__.py`, `bench.py`, `classifier.py`, `telemetry.py`) and
+  `source_sha256` (digest over those files plus the suite manifest);
+  `python -m experiments.source_identity TAG SUITE FILES...` computes them from
+  the tag's objects. `verify` / `run` fail closed unless the files on disk hash
+  to that digest, each selected task matches its suite pin (and contains no
+  symlink, special file or empty directory), no source file is a symlink or
+  missing, the tag resolves to the registered commit, and each file and task
+  (file set, bytes, executable bits) is identical to the object at that commit
+  (git is used with replace refs disabled). The checkout's HEAD is irrelevant:
+  newer controller code may run a frozen benchmark. `check`, `plan` and
+  `analyze` stay offline and never need the tag (`git fetch --tags` otherwise).
+- **Launcher.** A manifest cannot name a launcher: every attempt goes through
+  `experiments/launcher.py`, which is told the approved manifest hash. Before a
+  model call it refuses (exit 4, only `launch-refused.json` written) unless:
+  the source is verified (before the engine is imported, and again after, with
+  a private bytecode cache so a planted `.pyc` is never loaded), every loaded
+  `bench.*` module is a registered file, the bench arguments are exactly those
+  the manifest derives, the inference backend matches the manifest (`inference`
+  is `ollama` or `mock`; the engine's mock model is refused for a real
+  experiment), the model's manifest/config/weights digests match, and the arm's
+  prompt (the engine's base prompt plus `prompt_edit`, applied exactly once)
+  hashes to its pins. It then runs the unchanged engine behind a recorder that
+  hashes the system message of every request reaching the model-call function
+  (step loop and empty-reply retry alike). Only if all carried the pinned prompt
+  and at least one was made does it write `provenance.json`; otherwise
+  `launch-failed.json` is left and the attempt is quarantined. The controller
+  additionally requires the engine's own `transcript.json` to show the pinned
+  system prompt, so provenance cannot vouch for itself.
+- **Two prompt hashes.** `prompt_sha256` hashes the prompt *template* before the
+  engine expands `{max_steps}` (what the frozen EXP-2 wrapper recorded, so EXP-2
+  hashes are template hashes). `system_prompt_sha256` hashes the expanded system
+  message actually transmitted, observed at the model call. They are different
+  quantities.
+- **Coupling.** A runnable manifest executes the registered release: once
+  `bench/*.py` legitimately changes on `main`, tag a new benchmark version and
+  register a new manifest (and the launcher tests' `v0.5` reference) rather than
+  editing in place. Known limit: the model fingerprint is read from the local
+  Ollama store, not from the running server.
 - Limits: `run` has not been exercised against a live model; the decision rule
   compares only inference errors and timeouts, as the protocol words it.
 
