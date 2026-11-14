@@ -62,14 +62,55 @@ hours or overwrite experiment records.
   person files them under `<runs>/aborted/` (ignored by the matrix, kept as
   evidence), so a failed attempt is never silently re-rolled. Only the manifest's
   arm directories are policed; `aborted/`, `logs/` etc. beside them are not.
-  Each arm needs a `launch` entry that writes the provenance file (as
-  `exp2_entry` does); plain `bench.py` writes none and is refused.
+  An arm may name its own `launch` entry (which must write the provenance
+  file, as `exp2_entry` does); otherwise the generic launcher is used. Plain
+  `bench.py` is never launched directly.
 - `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).
   `experiments/exp2_records/` holds byte copies of its 36 `config.json`,
   `exp2_policy.json` and `results.json` (hashes in `SHA256SUMS`; `env.json` and
   transcripts stay in the ignored `runs/`). Tests reproduce 6/18 vs 9/18 and
   1.51x from them; with `runs/exp2` (or `EXP2_RUNS`) present they also check the
   copies match the originals, otherwise that check reports SKIPPED.
+- **Code identity (run-only).** A runnable manifest registers
+  `benchmark.tag` (an *annotated* tag), the full `commit`, `source_files` (at
+  least `bench/__init__.py`, `bench.py`, `classifier.py`, `telemetry.py`) and
+  `source_sha256` (digest over those files plus the suite manifest);
+  `python -m experiments.source_identity TAG SUITE FILES...` computes them from
+  the tag's objects. `verify` / `run` fail closed unless the files on disk hash
+  to that digest, each selected task matches its suite pin (and contains no
+  symlink, special file or empty directory), no source file is a symlink or
+  missing, the tag resolves to the registered commit, and each file and task
+  (file set, bytes, executable bits) is identical to the object at that commit
+  (git is used with replace refs disabled). The checkout's HEAD is irrelevant:
+  newer controller code may run a frozen benchmark. `check`, `plan` and
+  `analyze` stay offline and never need the tag (`git fetch --tags` otherwise).
+- **Launcher.** A manifest cannot name a launcher: every attempt goes through
+  `experiments/launcher.py`, which is told the approved manifest hash. Before a
+  model call it refuses (exit 4, only `launch-refused.json` written) unless:
+  the source is verified (before the engine is imported, and again after, with
+  a private bytecode cache so a planted `.pyc` is never loaded), every loaded
+  `bench.*` module is a registered file, the bench arguments are exactly those
+  the manifest derives, the inference backend matches the manifest (`inference`
+  is `ollama` or `mock`; the engine's mock model is refused for a real
+  experiment), the model's manifest/config/weights digests match, and the arm's
+  prompt (the engine's base prompt plus `prompt_edit`, applied exactly once)
+  hashes to its pins. It then runs the unchanged engine behind a recorder that
+  hashes the system message of every request reaching the model-call function
+  (step loop and empty-reply retry alike). Only if all carried the pinned prompt
+  and at least one was made does it write `provenance.json`; otherwise
+  `launch-failed.json` is left and the attempt is quarantined. The controller
+  additionally requires the engine's own `transcript.json` to show the pinned
+  system prompt, so provenance cannot vouch for itself.
+- **Two prompt hashes.** `prompt_sha256` hashes the prompt *template* before the
+  engine expands `{max_steps}` (what the frozen EXP-2 wrapper recorded, so EXP-2
+  hashes are template hashes). `system_prompt_sha256` hashes the expanded system
+  message actually transmitted, observed at the model call. They are different
+  quantities.
+- **Coupling.** A runnable manifest executes the registered release: once
+  `bench/*.py` legitimately changes on `main`, tag a new benchmark version and
+  register a new manifest (and the launcher tests' `v0.5` reference) rather than
+  editing in place. Known limit: the model fingerprint is read from the local
+  Ollama store, not from the running server.
 - Limits: `run` has not been exercised against a live model; the decision rule
   compares only inference errors and timeouts, as the protocol words it.
 
