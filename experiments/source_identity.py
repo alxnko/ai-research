@@ -37,6 +37,16 @@ from typing import Any
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The engine and everything it imports from the repository. A manifest may add
+# files but may not register less: a one-file identity would leave the
+# classifier or telemetry modules (which run in the engine process) unchecked.
+REQUIRED_SOURCE = (
+    "bench/__init__.py",
+    "bench/bench.py",
+    "bench/classifier.py",
+    "bench/telemetry.py",
+)
+
 
 def dir_digest(path: str) -> str:
     """Same algorithm as bench.task_digest, for any directory."""
@@ -67,12 +77,21 @@ def files_digest(root: str, paths: list[str]) -> str:
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", "-C", root, *args], capture_output=True, check=False, timeout=60
-    )
+    """git without replace refs (`git replace` could otherwise swap the very
+    objects the release is compared against); failures are results, not raises."""
+    cmd = ["git", "--no-replace-objects", "-C", root, *args]
+    try:
+        return subprocess.run(cmd, capture_output=True, check=False, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 127, b"", str(exc).encode())
 
 
 def resolve_tag(root: str, tag: str) -> str | None:
+    """The commit an *annotated* tag points at (a lightweight tag can be moved
+    without a trace, so it is not an acceptable release marker)."""
+    kind = _git(root, "cat-file", "-t", f"refs/tags/{tag}")
+    if kind.returncode != 0 or kind.stdout.decode().strip() != "tag":
+        return None
     proc = _git(root, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}")
     return proc.stdout.decode().strip() if proc.returncode == 0 else None
 
@@ -91,11 +110,77 @@ def _scratch() -> str | None:
     return "/var/tmp" if os.path.isdir("/var/tmp") else None
 
 
+def _tree_problems(tdir: str, task: str) -> list[str]:
+    """What a content digest cannot see: symlinks (the engine copies them as the
+    files they point at), special files and empty directories never belong to a
+    release, so any of them in a fixture is drift."""
+    problems = []
+    for dirpath, dirs, files in os.walk(tdir):
+        if not dirs and not files:
+            problems.append(f"task {task!r}: empty directory {dirpath}")
+        for name in [*dirs, *files]:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, tdir)
+            if os.path.islink(full):
+                problems.append(f"task {task!r}: {rel} is a symlink")
+            elif name in files and not os.path.isfile(full):
+                problems.append(f"task {task!r}: {rel} is not a regular file")
+    return problems
+
+
+def _tag_tree_problems(root: str, commit: str, task: str, tdir: str) -> list[str]:
+    """File set and executable bits of a fixture against the tag's tree."""
+    proc = _git(root, "ls-tree", "-r", commit, "--", f"bench/tasks/{task}")
+    if proc.returncode != 0:
+        return [f"task {task!r} tree unreadable at the tag"]
+    tagged = {}
+    for line in proc.stdout.decode().splitlines():
+        meta, _, path = line.partition("\t")
+        tagged[os.path.relpath(path, f"bench/tasks/{task}")] = meta.split()[0]
+    disk = {}
+    for dirpath, _, files in os.walk(tdir):
+        for name in files:
+            full = os.path.join(dirpath, name)
+            exec_bit = os.stat(full).st_mode & 0o100
+            disk[os.path.relpath(full, tdir)] = "100755" if exec_bit else "100644"
+    problems = [
+        f"task {task!r}: {p} is not in the tag"
+        for p in sorted(disk.keys() - tagged.keys())
+    ]
+    problems += [
+        f"task {task!r}: {p} is missing from disk"
+        for p in sorted(tagged.keys() - disk.keys())
+    ]
+    problems += [
+        f"task {task!r}: {p} mode differs from the tag"
+        for p in sorted(disk.keys() & tagged.keys())
+        if disk[p] != tagged[p]
+    ]
+    return problems
+
+
 def _suite_pins(root: str, suite: str) -> dict[str, str]:
     with open(
         os.path.join(root, "bench", "suites", f"{suite}.json"), encoding="utf-8"
     ) as f:
         return json.load(f)["tasks"]
+
+
+def _verify_fixtures(
+    manifest: dict[str, Any], root: str, pins: dict[str, str]
+) -> list[str]:
+    problems: list[str] = []
+    for task in manifest["tasks"]:
+        tdir = os.path.join(root, "bench", "tasks", task)
+        if task not in pins:
+            problems.append(f"task {task!r} is not in the suite")
+        elif not os.path.isdir(tdir) or os.path.islink(tdir):
+            problems.append(f"task {task!r} is missing or a symlink")
+        else:
+            if dir_digest(tdir) != pins[task]:
+                problems.append(f"task {task!r} fixtures differ from the suite pin")
+            problems += _tree_problems(tdir, task)
+    return problems
 
 
 def verify_source(
@@ -107,6 +192,9 @@ def verify_source(
         return [
             "manifest registers no source identity (frozen manifests are analysis-only)"
         ]
+    absent = [f for f in REQUIRED_SOURCE if f not in bench["source_files"]]
+    if absent:
+        return [f"source_files must include {absent}"]
     problems: list[str] = []
     paths = source_paths(manifest)
     for rel in paths:
@@ -123,14 +211,7 @@ def verify_source(
         pins = _suite_pins(root, bench["suite"])
     except (OSError, ValueError, KeyError) as exc:
         return [*problems, f"suite manifest unreadable ({type(exc).__name__})"]
-    for task in manifest["tasks"]:
-        tdir = os.path.join(root, "bench", "tasks", task)
-        if task not in pins:
-            problems.append(f"task {task!r} is not in the suite")
-        elif not os.path.isdir(tdir) or os.path.islink(tdir):
-            problems.append(f"task {task!r} is missing or a symlink")
-        elif dir_digest(tdir) != pins[task]:
-            problems.append(f"task {task!r} fixtures differ from the suite pin")
+    problems += _verify_fixtures(manifest, root, pins)
     if use_git:
         problems += _verify_against_tag(manifest, root, paths, pins)
     return problems
@@ -142,7 +223,7 @@ def _verify_against_tag(
     bench = manifest["benchmark"]
     commit = resolve_tag(root, bench["tag"])
     if commit is None:
-        return [f"tag {bench['tag']!r} not found (fetch tags: git fetch --tags)"]
+        return [f"tag {bench['tag']!r} is not an annotated tag here (git fetch --tags)"]
     if commit != bench["commit"]:
         return [
             f"tag {bench['tag']!r} resolves to {commit}, registered {bench['commit']}"
@@ -157,8 +238,14 @@ def _verify_against_tag(
             if f.read() != proc.stdout:
                 problems.append(f"{rel} differs from the tag")
     for task in manifest["tasks"]:
-        if task in pins and _tag_task_digest(root, commit, task) != pins[task]:
+        if task not in pins:
+            continue
+        if _tag_task_digest(root, commit, task) != pins[task]:
             problems.append(f"task {task!r} at the tag differs from the suite pin")
+        else:
+            problems += _tag_tree_problems(
+                root, commit, task, os.path.join(root, "bench", "tasks", task)
+            )
     return problems
 
 

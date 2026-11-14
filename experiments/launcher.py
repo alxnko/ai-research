@@ -1,49 +1,105 @@
 """Generic provenance-writing launcher for controller-run attempts.
 
-    python -m experiments.launcher --manifest M --arm A --run-dir DIR <bench args>
+    python -m experiments.launcher --manifest M --manifest-sha256 H --arm A \\
+        --run-dir DIR <bench args>
     python -m experiments.launcher --manifest M --arm A --print-hashes
 
-The controller starts this for every arm that has no launcher of its own. It
-derives everything it records from the approved manifest and from what it
-observes, never from values handed to it:
+The controller starts this for every attempt; a manifest cannot name another
+launcher. Everything it records is derived from the approved manifest and from
+what it observes, never from values handed to it.
 
-Before any model call (a failure here exits 4 and leaves `launch-refused.json`
-in the run directory; the engine has not started):
-  1. the bench arguments are exactly those the manifest derives for this
-     (arm, seed, task);
-  2. the benchmark code on disk is the registered release
-     (`source_identity.verify_source`, including the git tag);
-  3. the loaded engine modules are those files, not shadowed copies;
-  4. the model's manifest, config and weights digests match the manifest;
-  5. the arm's prompt, built from the engine's own base prompt plus the
-     manifest's `prompt_edit`, hashes to the pinned values.
+Order of events (a failure before step 5 exits 4 and leaves only
+`launch-refused.json`: the engine has not started, no model was called):
 
-Then the unchanged engine runs. The recorder wraps the engine's model-call
-function and hashes the system message of every request it actually receives.
-Only if every request carried exactly the pinned prompt, and at least one was
-made, is `provenance.json` written (exit code is then the engine's own, which
-is non-zero for a failed task by design). Otherwise `launch-failed.json` is
-written instead and the attempt is left for the controller to quarantine.
+ 1. Bytecode isolation: `sys.pycache_prefix` points at a fresh private
+    directory (children inherit it via PYTHONPYCACHEPREFIX), so a planted
+    `bench/__pycache__/*.pyc` can never be loaded in place of the verified
+    source. The engine is not imported yet.
+ 2. The benchmark code on disk is the registered release
+    (`source_identity.verify_source`, including the annotated tag). This runs
+    before the engine is imported, then again after (see 3).
+ 3. The engine and controller are imported; every loaded `bench.*` module must
+    be one of the registered source files, and the verification is repeated.
+ 4. The manifest is the one the controller approved (hash), the bench arguments
+    are exactly those it derives, the inference backend matches the manifest
+    (the engine's mock model is refused for a real experiment), the model's
+    manifest/config/weights digests match, and the arm's prompt (the engine's
+    own base prompt plus the manifest's `prompt_edit`) hashes to its pins.
+ 5. The unchanged engine runs behind a recorder that hashes the system message
+    of every request reaching the model-call function (the step loop and the
+    empty-reply retry both go through it). Only if every request carried exactly
+    the pinned prompt, and at least one was made, is `provenance.json` written
+    (the exit code is then the engine's own: non-zero for a failed task by
+    design). Otherwise `launch-failed.json` is written and the controller
+    quarantines the attempt.
+
+Hash conventions: `prompt_sha256` is the hash of the prompt *template*, before
+the engine expands `{max_steps}` (the convention of the frozen EXP-2 wrapper,
+whose recorded hashes are of that kind). `system_prompt_sha256` is the hash of
+the expanded text actually transmitted, observed at the model call. They are
+different quantities and are not comparable with each other.
+
+Known limit: the observation point is the model-call function's arguments. The
+HTTP body is built from that same message list; the server's own model store
+(as opposed to the local one the fingerprint is read from) is not inspected.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import importlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Generator, Mapping
 from typing import Any
 
-from bench import bench as engine
-from experiments import controller, source_identity
+from experiments import source_identity  # stdlib only; no bench import
 
 REFUSED, FAILED = 4, 5
 
 
+@contextlib.contextmanager
+def isolated_bytecode() -> Generator[None]:
+    """Step 1. Compiled modules next to the sources (bench/__pycache__) are never
+    consulted while this is active; imports compile into a private directory
+    that child processes (the forkserver) inherit. Scoped, so a process that
+    merely imports this module keeps its normal bytecode caching."""
+    private = tempfile.mkdtemp(prefix="launcher-pycache-")
+    saved = (sys.pycache_prefix, os.environ.get("PYTHONPYCACHEPREFIX"))
+    sys.pycache_prefix = private
+    os.environ["PYTHONPYCACHEPREFIX"] = private
+    try:
+        yield
+    finally:
+        sys.pycache_prefix = saved[0]
+        if saved[1] is None:
+            os.environ.pop("PYTHONPYCACHEPREFIX", None)
+        else:
+            os.environ["PYTHONPYCACHEPREFIX"] = saved[1]
+        shutil.rmtree(private, ignore_errors=True)
+
+
+def _engine() -> Any:
+    return importlib.import_module("bench.bench")
+
+
+def _controller() -> Any:
+    return importlib.import_module("experiments.controller")
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def backend() -> str:
+    """The inference backend the engine will use (its own mock criterion)."""
+    return "mock" if os.environ.get("BENCH_MOCK_MODEL") == "1" else "ollama"
 
 
 def base_prompt(manifest: dict[str, Any]) -> tuple[str, str]:
@@ -53,7 +109,7 @@ def base_prompt(manifest: dict[str, Any]) -> tuple[str, str]:
         if manifest["settings"]["actuator"] == "native_tools"
         else "SYSTEM_PROMPT_TEXT"
     )
-    return name, getattr(engine, name)
+    return name, getattr(_engine(), name)
 
 
 def arm_prompt(manifest: dict[str, Any], arm: str) -> tuple[str, str]:
@@ -90,8 +146,12 @@ class Recorder:
     def wrap(self, fn):
         def recorded(*args, **kwargs):
             msgs = kwargs["msgs"] if "msgs" in kwargs else args[1]
+            first = msgs[0]
             self.calls += 1
-            self.system_hashes.add(_sha(msgs[0]["content"]))
+            if first.get("role") == "system":
+                self.system_hashes.add(_sha(first["content"]))
+            else:  # a request without its system message can never match a pin
+                self.system_hashes.add(f"not-a-system-message:{first.get('role')}")
             return fn(*args, **kwargs)
 
         return recorded
@@ -117,10 +177,36 @@ def _write(run_dir: str, name: str, doc: dict[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def loaded_module_problems(
+    manifest: dict[str, Any], modules: Mapping[str, Any] | None = None
+) -> list[str]:
+    """Every `bench` module in memory must be a registered, verified source file
+    loaded from this repository, and bytecode must not be read from the tree."""
+    problems = []
+    if sys.pycache_prefix is None:
+        problems.append("bytecode cache is not isolated (sys.pycache_prefix unset)")
+    registered = {*manifest["benchmark"]["source_files"]}
+    root = os.path.realpath(source_identity.ROOT)
+    for name, module in (modules if modules is not None else sys.modules).items():
+        if name != "bench" and not name.startswith("bench."):
+            continue
+        path = getattr(module, "__file__", None)
+        rel = os.path.relpath(os.path.realpath(path), root) if path else None
+        if rel is None or rel.startswith("..") or rel not in registered:
+            problems.append(
+                f"{name} was loaded from {path}, not a registered source file"
+            )
+    return problems
+
+
 def pre_inference_problems(
-    manifest: dict[str, Any], arm: str, bench_args: list[str]
+    manifest: dict[str, Any],
+    arm: str,
+    bench_args: list[str],
+    modules: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Everything that must hold before the model is called."""
+    controller, engine = _controller(), _engine()
     problems: list[str] = []
     facts: dict[str, Any] = {}
     parsed = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -137,7 +223,15 @@ def pre_inference_problems(
     facts["seed"], facts["task"] = known.seed, known.task
 
     problems += source_identity.verify_source(manifest)
-    problems += _loaded_module_problems()
+    problems += loaded_module_problems(manifest, modules)
+
+    wanted = manifest.get("inference", "ollama")
+    facts["inference_backend"] = backend()
+    if facts["inference_backend"] != wanted:
+        problems.append(
+            f"inference backend is {facts['inference_backend']!r} but the manifest "
+            f"registers {wanted!r} (BENCH_MOCK_MODEL must not leak into real runs)"
+        )
 
     fingerprint = engine.model_fingerprint(manifest["model"]["tag"])
     facts["model_fingerprint"] = {
@@ -161,26 +255,38 @@ def pre_inference_problems(
     return problems, facts
 
 
-def _loaded_module_problems() -> list[str]:
-    """The engine modules in memory must be the files that were verified."""
-    problems = []
-    for module in ("bench.bench", "bench.classifier", "bench.telemetry"):
-        loaded = sys.modules.get(module)
-        expected = os.path.join(source_identity.ROOT, *module.split(".")) + ".py"
-        path = getattr(loaded, "__file__", None)
-        if path is None or os.path.realpath(path) != os.path.realpath(expected):
-            problems.append(f"{module} was loaded from {path}, not {expected}")
-    return problems
+def _refuse(run_dir: str | None, problems: list[str]) -> int:
+    if run_dir:
+        _write(run_dir, "launch-refused.json", {"problems": problems})
+    print("launch refused:\n  " + "\n  ".join(problems), file=sys.stderr)
+    return REFUSED
 
 
 def main(argv: list[str] | None = None) -> int:
+    with isolated_bytecode():  # before the engine is imported
+        return _main(argv)
+
+
+def _main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--manifest-sha256")
     parser.add_argument("--arm", required=True)
     parser.add_argument("--run-dir")
     parser.add_argument("--print-hashes", action="store_true")
     args, bench_args = parser.parse_known_args(argv)
 
+    # Step 2, before the engine is imported: the files on disk are the release.
+    try:
+        with open(args.manifest, encoding="utf-8") as f:
+            raw = json.load(f)
+        early = source_identity.verify_source(raw)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        early = [f"manifest unreadable or malformed ({type(exc).__name__})"]
+    if early and not args.print_hashes:
+        return _refuse(args.run_dir, early)
+
+    controller = _controller()
     manifest = controller.load_manifest(args.manifest)
     if args.arm not in manifest["arms"]:
         print(f"unknown arm {args.arm!r}", file=sys.stderr)
@@ -188,19 +294,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_hashes:
         print(json.dumps(prompt_hashes(manifest, args.arm), indent=2))
         return 0
-    if not args.run_dir or manifest.get("frozen"):
-        print(
-            "a --run-dir and a runnable (non-frozen) manifest are required",
-            file=sys.stderr,
+    gate = [
+        text
+        for failed, text in (
+            (not args.run_dir, "a --run-dir is required"),
+            (
+                bool(manifest.get("frozen")),
+                "a runnable (non-frozen) manifest is required",
+            ),
+            (
+                args.manifest_sha256 != controller.manifest_sha256(manifest),
+                "the manifest is not the one the controller approved",
+            ),
         )
-        return REFUSED
-
-    problems, facts = pre_inference_problems(manifest, args.arm, bench_args)
-    if problems:
-        _write(args.run_dir, "launch-refused.json", {"problems": problems})
-        print("launch refused:\n  " + "\n  ".join(problems), file=sys.stderr)
-        return REFUSED
-
+        if failed
+    ]
+    problems, facts = (
+        ([], {}) if gate else pre_inference_problems(manifest, args.arm, bench_args)
+    )
+    if gate or problems:
+        return _refuse(args.run_dir, [*gate, *problems])
     return _execute(manifest, args.arm, args.run_dir, bench_args, facts)
 
 
@@ -211,6 +324,7 @@ def _execute(
     bench_args: list[str],
     facts: dict[str, Any],
 ) -> int:
+    controller, engine = _controller(), _engine()
     attempt = controller.attempt_id(manifest, arm, facts["seed"], facts["task"])
     _write(
         run_dir,
@@ -223,7 +337,8 @@ def _execute(
     setattr(engine, prompt_attr, template)
     engine.chat_stream = recorder.wrap(engine.chat_stream)
     engine._mock_chat_stream = recorder.wrap(engine._mock_chat_stream)
-    sys.argv = [sys.argv[0], "--run-dir", run_dir, *bench_args]
+    saved_argv = sys.argv
+    sys.argv = [saved_argv[0], "--run-dir", run_dir, *bench_args]
     try:
         rc = engine.main()
     except SystemExit as exc:  # the engine's own early exits
@@ -232,6 +347,8 @@ def _execute(
         _write(run_dir, "launch-failed.json", {"engine_crash": repr(exc)})
         print(f"launch failed: engine raised {exc!r}", file=sys.stderr)
         return FAILED
+    finally:
+        sys.argv = saved_argv
 
     failures = observed_problems(recorder, facts["system_prompt_sha256"])
     if failures:
@@ -251,6 +368,7 @@ def _execute(
             "benchmark_core_commit": bench["commit"],
             "source_sha256": bench["source_sha256"],
             "source_verification": "git+filesystem",
+            "inference_backend": facts["inference_backend"],
             "model_fingerprint": facts["model_fingerprint"],
             "prompt_sha256": facts["prompt_sha256"],
             "system_prompt_sha256": next(iter(recorder.system_hashes)),

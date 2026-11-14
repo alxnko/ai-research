@@ -28,11 +28,12 @@ import hashlib
 import json
 import math
 import os
+import pathlib
 import re
 import statistics
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from fractions import Fraction
 from typing import Any
 
@@ -59,6 +60,7 @@ _TOP: dict[str, type] = {
     "runs_dir": str,
     "provenance_file": str,
     "integrity": str,
+    "inference": str,
     "aborted": list,
     "analysis": dict,
 }
@@ -159,12 +161,16 @@ def _identity_problems(m: dict[str, Any], errors: list[str]) -> None:
         )
     ):
         errors.append("benchmark.source_files: must be relative paths")
-    elif isinstance(files, list) and "bench/bench.py" not in files:
-        errors.append("benchmark.source_files: must include bench/bench.py")
+    elif isinstance(files, list) and (
+        absent := [f for f in source_identity.REQUIRED_SOURCE if f not in files]
+    ):
+        errors.append(f"benchmark.source_files: must include {absent}")
     if digest is not None and not (
         isinstance(digest, str) and _HEX64.fullmatch(digest)
     ):
         errors.append("benchmark.source_sha256: must be a sha256 hex digest")
+    if m.get("inference", "ollama") not in ("ollama", "mock"):
+        errors.append("inference: must be 'ollama' or 'mock'")
     if m.get("frozen") is False:
         for key in ("source_files", "source_sha256"):
             if key not in bench:
@@ -206,6 +212,7 @@ def validate_manifest(m: Any) -> list[str]:
         "aborted",
         "provenance_file",
         "integrity",
+        "inference",
     }  # frozen: fail closed
     for key in sorted(required - set(m)):
         errors.append(f"{key}: missing")
@@ -245,16 +252,12 @@ def validate_manifest(m: Any) -> list[str]:
         if not (isinstance(digest, str) and len(digest) == 64):
             errors.append(f"arms.{name}.prompt_sha256: must be a sha256 hex digest")
         extra = (
-            set(arm)
-            - {"prompt_sha256", "launch", "system_prompt_sha256", "prompt_edit"}
+            set(arm) - {"prompt_sha256", "system_prompt_sha256", "prompt_edit"}
             if isinstance(arm, dict)
             else ()
         )
         if extra:
             errors.append(f"arms.{name}: unknown keys {sorted(extra)}")
-        launch = arm.get("launch", []) if isinstance(arm, dict) else []
-        if not (isinstance(launch, list) and all(isinstance(a, str) for a in launch)):
-            errors.append(f"arms.{name}.launch: must be a list of strings")
         _arm_problems(m, name, arm, errors)
     analysis = m["analysis"]
     if set(analysis) != {"control", "treatment", "min_ratio"}:
@@ -290,13 +293,9 @@ def load_manifest(path: str) -> dict[str, Any]:
 
 
 def manifest_sha256(manifest: dict[str, Any]) -> str:
-    """Hash of what defines the experiment; not of where or how it was launched
-    (interpreter paths, run directory, free-text notes)."""
+    """Hash of what defines the experiment; not of where it is recorded
+    (run directory) or of free-text notes."""
     ident = {k: v for k, v in manifest.items() if k not in ("aborted", "runs_dir")}
-    ident["arms"] = {
-        name: {"prompt_sha256": spec["prompt_sha256"]}
-        for name, spec in manifest["arms"].items()
-    }
     blob = json.dumps(ident, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -451,10 +450,19 @@ def validate_attempt(
     if problems:
         return problems
     try:
-        return _check_records(manifest, arm, seed, task, docs) + _binding_problems(
-            manifest, arm, seed, task, cell
-        )
-    except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+        found = _check_records(manifest, arm, seed, task, docs)
+        found += _binding_problems(manifest, arm, seed, task, cell)
+        if not manifest.get("frozen"):
+            found += _transcript_problems(manifest, arm, cell)
+        return found
+    except (
+        OSError,
+        AttributeError,
+        TypeError,
+        KeyError,
+        IndexError,
+        ValueError,
+    ) as exc:
         return [f"malformed record ({type(exc).__name__}: {exc})"]
 
 
@@ -567,7 +575,26 @@ def _check_records(
             prov.get("attempt_id") == attempt_id(manifest, arm, seed, task),
             "provenance belongs to another attempt",
         )
+        want(
+            prov.get("inference_backend") == manifest.get("inference", "ollama"),
+            "the inference backend differs from the manifest's (mock vs real)",
+        )
     return problems
+
+
+def _transcript_problems(manifest: dict[str, Any], arm: str, cell: str) -> list[str]:
+    """Independent evidence: the engine's own transcript must show the pinned
+    system prompt as its first message, whatever the provenance file claims."""
+    found = list(pathlib.Path(cell).rglob("transcript.json"))
+    if len(found) != 1:
+        return ["expected exactly one engine transcript.json"]
+    first = _read_json(str(found[0]))["steps"][0]
+    sent = hashlib.sha256(first["content"].encode("utf-8")).hexdigest()
+    ok = (
+        first.get("role") == "system"
+        and sent == manifest["arms"][arm]["system_prompt_sha256"]
+    )
+    return [] if ok else ["the transcript's system prompt differs from the arm's pin"]
 
 
 def scan(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
@@ -828,8 +855,8 @@ def _write_attempt(
             os.fsync(f.fileno())
 
 
-def default_launch(manifest_path: str, arm: str) -> list[str]:
-    """The generic provenance-writing launcher for an arm without its own."""
+def default_launch(manifest_path: str, arm: str, manifest_hash: str) -> list[str]:
+    """The generic provenance-writing launcher, told which manifest was approved."""
     return [
         sys.executable,
         "-m",
@@ -838,21 +865,23 @@ def default_launch(manifest_path: str, arm: str) -> list[str]:
         os.path.abspath(manifest_path),
         "--arm",
         arm,
+        "--manifest-sha256",
+        manifest_hash,
     ]
 
 
 def _preflight_run(
-    manifest: dict[str, Any], runs: str, live: bool, manifest_path: str
+    manifest: dict[str, Any],
+    runs: str,
+    live: bool,
+    manifest_path: str,
+    launch_for: Callable[[str], list[str]] | None = None,
 ) -> list[str]:
     problems = preflight(manifest, live=live)
     if live:  # run-only: the code about to execute must be the registered code
         problems += source_identity.verify_source(manifest)
-    if not manifest_path:
-        problems += [
-            f"arm {arm!r} has no launch entry and no manifest path (generic launcher)"
-            for arm, spec in manifest["arms"].items()
-            if not spec.get("launch")
-        ]
+    if not (manifest_path or launch_for):
+        problems.append("no manifest path for the generic launcher")
     state = scan(manifest, runs)
     for key, info in state["cells"].items():
         name = "/".join(map(str, key))
@@ -874,7 +903,11 @@ def run(
     *,
     live: bool = True,
     manifest_path: str = "",
+    launch_for: Callable[[str], list[str]] | None = None,
 ) -> int:
+    """`launch_for` replaces the generic launcher; it exists for tests only. A
+    manifest cannot name its own launcher, so provenance always comes from the
+    verified one."""
     if manifest.get("frozen"):
         print(f"{manifest['experiment']} is frozen: analysis only.", file=sys.stderr)
         return 2
@@ -885,13 +918,17 @@ def run(
         except BlockingIOError:
             print("another controller is running on these records", file=sys.stderr)
             return 2
-        return _run_locked(manifest, runs, live, manifest_path)
+        return _run_locked(manifest, runs, live, manifest_path, launch_for)
 
 
 def _run_locked(
-    manifest: dict[str, Any], runs: str, live: bool, manifest_path: str
+    manifest: dict[str, Any],
+    runs: str,
+    live: bool,
+    manifest_path: str,
+    launch_for: Callable[[str], list[str]] | None,
 ) -> int:
-    problems = _preflight_run(manifest, runs, live, manifest_path)
+    problems = _preflight_run(manifest, runs, live, manifest_path, launch_for)
     if problems:
         print("preflight failed:\n  " + "\n  ".join(problems), file=sys.stderr)
         return 2
@@ -904,8 +941,10 @@ def _run_locked(
         # Reserve the attempt before anything can fail: from here on the attempt
         # has left evidence, so it can never be silently retried.
         os.makedirs(stage)
-        launch = manifest["arms"][arm].get("launch") or default_launch(
-            manifest_path, arm
+        launch = (
+            launch_for(arm)
+            if launch_for
+            else default_launch(manifest_path, arm, manifest_sha256(manifest))
         )
         name = f"{arm} seed{seed} {task}"
         try:
