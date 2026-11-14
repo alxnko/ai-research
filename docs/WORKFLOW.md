@@ -37,6 +37,29 @@ hours or overwrite experiment records.
 - `make report` evaluates the registered EXP-2 analysis only. Never call it a
   winner if the matrix is incomplete or environments/policies are mixed.
 
+## Experiment controller
+
+`experiments/controller.py` derives the whole attempt matrix from one manifest
+(`experiments/manifests/`) and enforces it; offline, no Ollama or GPU needed.
+
+- `check` (manifest vs suite pins), `status`/`analyze` (every recorded attempt
+  is validated against the manifest: fixture digest, model identity, prompt
+  hash, settings, seed and exact bench invocation), `plan`, and `run`.
+- `analyze` exits non-zero while any attempt is missing, invalid or unexpected
+  and withholds the decision; a zero-success arm is reported as
+  `no_success` (0.0 tasks/h), never as a missing value. A control with no
+  successes makes the ratio undefined and says so.
+- `run` stages each attempt in `<cell>.partial`, validates it, then promotes it
+  with one rename. Invalid or interrupted attempts are kept as `.invalid-N` /
+  `.aborted-N`, never deleted or overwritten; a valid cell is never re-run.
+  Each arm needs a `launch` entry that writes the provenance file (as
+  `exp2_entry` does); plain `bench.py` writes none and is refused.
+- `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).
+  `experiments/exp2_records/` holds byte copies of its 36 `config.json`,
+  `exp2_policy.json` and `results.json` (hashes in `SHA256SUMS`; `env.json` and
+  transcripts stay in the ignored `runs/`). Tests reproduce 6/18 vs 9/18 and
+  1.51x from them; with `runs/exp2` present they also check the copies match.
+
 ## Harness and scorer changes
 
 - The **engineering agent** may inspect fixtures to audit scorer correctness.
