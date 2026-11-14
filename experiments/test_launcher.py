@@ -814,6 +814,35 @@ class TestIncompleteAndObserved(Release):
         )
         self.assertEqual(prov["model_calls"], 1)
 
+    def test_the_real_model_call_function_is_observed(self):
+        """`chat_stream` (the real Ollama path) is wrapped like the mock one."""
+        reached = []
+
+        def stub(model, msgs, *rest, **kwargs):  # stands in for the HTTP call
+            reached.append(msgs[0]["content"])
+
+        def honest():
+            engine.chat_stream(
+                "m",
+                [
+                    {
+                        "role": "system",
+                        "content": engine.SYSTEM_PROMPT_TOOLS.format(max_steps=20),
+                    },
+                    {"role": "user", "content": "x"},
+                ],
+                1,
+                0,
+            )
+            return 0
+
+        with mock.patch.object(engine, "chat_stream", stub):
+            _m, stage, code = self.run_with_fake_engine(honest)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reached), 1)  # the call went through to the function
+        prov = json.loads(pathlib.Path(stage, "provenance.json").read_text())
+        self.assertEqual(prov["model_calls"], 1)
+
     def test_the_engine_prompt_is_the_arms_prompt(self):
         seen = {}
 
