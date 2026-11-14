@@ -31,6 +31,7 @@ import statistics
 import subprocess
 import sys
 from collections.abc import Iterator
+from fractions import Fraction
 from typing import Any
 
 from bench import bench as engine
@@ -99,6 +100,32 @@ def _typed(obj: Any, spec: dict[str, type], where: str, errors: list[str]) -> No
             errors.append(f"{where}.{key}: unknown key")
 
 
+def _ranges(settings: dict[str, Any], errors: list[str]) -> None:
+    """Values must be finite and inside the range bench.py can actually use."""
+    sampling = settings.get("sampling")
+    numbers = {
+        "settings.ctx": (settings.get("ctx"), 1, None),
+        "settings.steps": (settings.get("steps"), 1, None),
+        "settings.max_wall": (settings.get("max_wall"), 1, None),
+        "settings.ngpu": (settings.get("ngpu"), 0, None),
+    }
+    if isinstance(sampling, dict):
+        numbers |= {
+            "sampling.temperature": (sampling.get("temperature"), 0, None),
+            "sampling.top_p": (sampling.get("top_p"), 0, 1),
+            "sampling.top_k": (sampling.get("top_k"), 0, None),
+            "sampling.repeat_penalty": (sampling.get("repeat_penalty"), 0, None),
+        }
+    for name, (value, low, high) in numbers.items():
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            continue  # the type error is reported by _typed
+        too_low = value < low or (name.endswith("top_p") and value == 0)
+        if not math.isfinite(value) or too_low or (high is not None and value > high):
+            errors.append(f"{name}: out of range")
+    if isinstance(sampling, dict) and sampling.get("repeat_penalty") == 0:
+        errors.append("sampling.repeat_penalty: must be positive")
+
+
 def validate_manifest(m: Any) -> list[str]:
     """Schema problems of a manifest (empty list: valid)."""
     errors: list[str] = []
@@ -126,14 +153,17 @@ def validate_manifest(m: Any) -> list[str]:
     _typed(m["model"], _MODEL, "model", errors)
     _typed(m["settings"], _SETTINGS, "settings", errors)
     _typed(m["settings"].get("sampling"), _SAMPLING, "settings.sampling", errors)
-    for field in ("tasks", "seeds"):
-        items = m[field]
-        if not items or len(set(items)) != len(items):
-            errors.append(f"{field}: must be non-empty and unique")
     if not all(isinstance(t, str) and _NAME.fullmatch(t) for t in m["tasks"]):
         errors.append("tasks: must be plain names (letters, digits, . _ -)")
     if not all(isinstance(s, int) and not isinstance(s, bool) for s in m["seeds"]):
         errors.append("seeds: must be integers")
+    for field in ("tasks", "seeds"):
+        items = m[field]
+        # uniqueness only once every item is known to be a hashable scalar
+        scalar = all(isinstance(i, str | int | float | bool) for i in items)
+        if not items or (scalar and len(set(items)) != len(items)):
+            errors.append(f"{field}: must be non-empty and unique")
+    _ranges(m["settings"], errors)
     if not m["arms"]:
         errors.append("arms: must not be empty")
     for name, arm in m["arms"].items():
@@ -157,7 +187,10 @@ def validate_manifest(m: Any) -> list[str]:
         errors.append("analysis: control and treatment must differ")
     ratio = analysis.get("min_ratio")
     if not (
-        isinstance(ratio, int | float) and not isinstance(ratio, bool) and ratio > 0
+        isinstance(ratio, int | float)
+        and not isinstance(ratio, bool)
+        and math.isfinite(ratio)
+        and ratio > 0
     ):
         errors.append("analysis.min_ratio: must be a positive number")
     for field in ("runs_dir", "integrity"):
@@ -495,7 +528,7 @@ def wilson(successes: int, n: int) -> tuple[float, float]:
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ok = [r for r in rows if r.get("run_successful")]
-    wall = sum(r.get("total_wall_s") or 0.0 for r in rows)
+    wall = math.fsum(r.get("total_wall_s") or 0.0 for r in rows)
     walls = sorted(r.get("total_wall_s") or 0.0 for r in rows)
     return {
         "attempts": len(rows),
@@ -504,6 +537,8 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "success_rate": len(ok) / len(rows) if rows else None,
         "wilson95": wilson(len(ok), len(rows)),
         "total_wall_s": round(wall, 1),
+        # unrounded: the decision uses this, never the rounded display values
+        "wall_exact": wall,
         # zero successes over positive wall time is a measured 0.0 tasks/h
         "verified_tasks_per_hour": round(3600 * len(ok) / wall, 2) if wall else None,
         "median_wall_s": round(statistics.median(walls), 1) if walls else None,
@@ -542,21 +577,29 @@ def decide(
             "reason": f"control has 0 verified successes (treatment {t['successes']}); "
             "the throughput ratio is undefined, so the rule is not evaluated",
         }
-    c_rate, t_rate = c["verified_tasks_per_hour"], t["verified_tasks_per_hour"]
-    if not c_rate or t_rate is None:
+    if not c["wall_exact"] or not t["wall_exact"]:
         return {
             "status": "ratio_undefined",
             "met": None,
             "reason": "an arm has no recorded wall time, so throughput is undefined",
         }
-    ratio = t_rate / c_rate
+    # (t_succ / t_wall) / (c_succ / c_wall) in exact arithmetic: display rounding
+    # (4.004 shown as 4.00) must never move a result across the threshold.
+    ratio = (Fraction(t["successes"]) * Fraction(c["wall_exact"])) / (
+        Fraction(c["successes"]) * Fraction(t["wall_exact"])
+    )
     met = (
-        ratio >= spec["min_ratio"]
+        ratio >= Fraction(str(spec["min_ratio"]))
         and t["successes"] >= c["successes"]
         and t["inference_errors"] <= c["inference_errors"]
         and t["timeouts"] <= c["timeouts"]
     )
-    return {"status": "evaluated", "met": met, "ratio": round(ratio, 2)}
+    return {
+        "status": "evaluated",
+        "met": met,
+        "ratio": round(float(ratio), 2),  # display only
+        "ratio_exact": float(ratio),
+    }
 
 
 def analyze(manifest: dict[str, Any], runs: str) -> dict[str, Any]:
@@ -664,6 +707,11 @@ def promote(
     return []
 
 
+def _mark(stage: str, text: str) -> None:
+    with open(os.path.join(stage, "controller-note.txt"), "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+
 def _write_attempt(
     manifest: dict[str, Any],
     key: tuple[str, int, str],
@@ -729,15 +777,24 @@ def _run_locked(manifest: dict[str, Any], runs: str, live: bool) -> int:
             print(f"SKIP {arm} seed{seed} {task} (valid)")
             continue
         stage = cell + ".partial"
-        os.makedirs(os.path.dirname(cell), exist_ok=True)
+        # Reserve the attempt before anything can fail: from here on the attempt
+        # has left evidence, so it can never be silently retried.
+        os.makedirs(stage)
         launch = manifest["arms"][arm]["launch"]
-        subprocess.run(
-            [*launch, "--run-dir", stage, *bench_argv(manifest, seed, task)],
-            cwd=ROOT,
-            check=False,  # a failed task exits non-zero by design
-        )
-        if not os.path.isdir(stage):
-            print(f"{arm} seed{seed} {task}: no output produced", file=sys.stderr)
+        name = f"{arm} seed{seed} {task}"
+        try:
+            subprocess.run(
+                [*launch, "--run-dir", stage, *bench_argv(manifest, seed, task)],
+                cwd=ROOT,
+                check=False,  # a failed task exits non-zero by design
+            )
+        except OSError as exc:
+            _mark(stage, f"launcher could not start: {exc}")
+            print(f"HALT {name}: launcher could not start ({exc})", file=sys.stderr)
+            return 3
+        if not os.listdir(stage):
+            _mark(stage, "launcher exited without writing any output")
+            print(f"HALT {name}: no output produced", file=sys.stderr)
             return 3
         try:
             _write_attempt(manifest, (arm, seed, task), stage)
@@ -779,7 +836,7 @@ def _print_report(report: dict[str, Any]) -> None:
             + ("  [NO VERIFIED SUCCESS]" if d["outcome"] == "no_success" else "")
         )
     d = report["decision"]
-    ratio = f" ratio {d['ratio']}x" if "ratio" in d else ""
+    ratio = f" ratio {d['ratio_exact']:.4f}x" if "ratio_exact" in d else ""
     print(f"\ndecision: {d['status']} met={d['met']}{ratio} {d.get('reason', '')}")
 
 

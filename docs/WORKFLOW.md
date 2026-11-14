@@ -53,7 +53,10 @@ hours or overwrite experiment records.
   and withholds the decision. A zero-success arm is `no_success` (0.0 tasks/h).
   If control has no successes the ratio is undefined and the rule is not
   evaluated (a deliberate, conservative reading; the protocol is silent).
-- `run` takes an exclusive lock, stages each attempt in `<cell>.partial`,
+  The decision uses exact arithmetic on unrounded wall time; rounding is display-only.
+- `run` takes an exclusive lock and reserves each attempt (`<cell>.partial`)
+  before launching, so even a launcher that never starts leaves evidence; it
+  stages each attempt in that directory,
   validates it, then promotes it with one rename. Invalid or interrupted
   attempts stay as `.invalid-N` / `.partial`, and the next `run` refuses until a
   person files them under `<runs>/aborted/` (ignored by the matrix, kept as

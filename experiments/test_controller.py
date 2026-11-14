@@ -222,6 +222,83 @@ class TestManifestSchema(unittest.TestCase):
             self.assertTrue(controller.validate_manifest(m), label)
 
 
+class TestManifestRobustness(unittest.TestCase):
+    JUNK = ({}, [], [{}], [[]], None, 1, "x", True, float("nan"), {"a": 1})
+
+    def test_malformed_values_are_reported_never_raised(self):
+        base = manifest()
+        paths = [(field,) for field in base] + [
+            ("settings", "ctx"),
+            ("settings", "sampling"),
+            ("settings", "sampling", "top_p"),
+            ("arms", "control"),
+            ("arms", "control", "launch"),
+            ("analysis", "min_ratio"),
+            ("model", "tag"),
+            ("benchmark", "suite"),
+        ]
+        for path in paths:
+            for junk in self.JUNK:
+                m = copy.deepcopy(base)
+                node = m
+                for part in path[:-1]:
+                    node = node[part]
+                node[path[-1]] = junk
+                try:
+                    problems = controller.validate_manifest(m)
+                except Exception as exc:  # the contract: never raise
+                    self.fail(f"{path}={junk!r} raised {type(exc).__name__}: {exc}")
+                expected = base_value(base, path)
+                numeric = all(
+                    isinstance(v, int | float) and not isinstance(v, bool)
+                    for v in (junk, expected)
+                )
+                if (
+                    expected is not None
+                    and not numeric
+                    and type(junk) is not type(expected)
+                ):
+                    self.assertTrue(problems, f"{path}={junk!r} was accepted")
+
+    def test_ranges_and_non_finite_numbers(self):
+        def with_(path, value):
+            m = copy.deepcopy(manifest())
+            node = m
+            for part in path[:-1]:
+                node = node[part]
+            node[path[-1]] = value
+            return controller.validate_manifest(m)
+
+        bad = {
+            ("settings", "sampling", "top_p"): [0.0, 1.5, -0.1, float("nan")],
+            ("settings", "sampling", "temperature"): [-1.0, float("inf")],
+            ("settings", "sampling", "repeat_penalty"): [0.0, float("inf")],
+            ("settings", "sampling", "top_k"): [-1],
+            ("settings", "steps"): [0, -3],
+            ("settings", "max_wall"): [0],
+            ("settings", "ctx"): [0],
+            ("settings", "ngpu"): [-1],
+            ("analysis", "min_ratio"): [float("inf"), float("nan"), -1.0],
+        }
+        for path, values in bad.items():
+            for value in values:
+                self.assertTrue(with_(path, value), f"{path}={value!r} accepted")
+        good = {
+            ("settings", "sampling", "top_p"): [0.95, 1.0],
+            ("settings", "steps"): [1, 20],
+        }
+        for path, values in good.items():
+            for value in values:
+                self.assertEqual(with_(path, value), [], f"{path}={value!r}")
+
+
+def base_value(base: dict[str, Any], path: tuple[str, ...]) -> Any:
+    node: Any = base
+    for part in path:
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
 class TestProvenance(Scratch):
     """Each tampered record is rejected; the untouched twin is valid."""
 
@@ -461,13 +538,14 @@ class TestBinding(Scratch):
 
 
 class TestDecisionRule(unittest.TestCase):
-    """Each condition of the registered rule is decisive on its own."""
+    """Each condition of the registered rule is decisive on its own, and the
+    decision uses exact (never display-rounded) throughput."""
 
     @staticmethod
-    def stats(successes, rate, errors=0, timeouts=0):
+    def stats(successes, wall, errors=0, timeouts=0):
         return {
             "successes": successes,
-            "verified_tasks_per_hour": rate,
+            "wall_exact": wall,
             "inference_errors": errors,
             "timeouts": timeouts,
         }
@@ -478,28 +556,50 @@ class TestDecisionRule(unittest.TestCase):
         )
 
     def test_boundaries(self):
-        base = self.stats(6, 20.0)
+        # equal successes, so ratio = control_wall / treatment_wall
+        base = self.stats(6, 1000.0)
         cases = {
-            "exactly 1.25x": (self.stats(6, 25.0), True),
-            "just below 1.25x": (self.stats(6, 24.9), False),
-            "fewer successes": (self.stats(5, 40.0), False),
-            "equal successes": (self.stats(6, 40.0), True),
-            "more inference errors": (self.stats(9, 40.0, errors=1), False),
-            "more timeouts": (self.stats(9, 40.0, timeouts=1), False),
+            "exactly 1.25x": (self.stats(6, 800.0), True),
+            "just below 1.25x": (self.stats(6, 800.001), False),
+            "just above 1.25x": (self.stats(6, 799.999), True),
+            "fewer successes": (self.stats(5, 400.0), False),
+            "equal successes": (self.stats(6, 400.0), True),
+            "more inference errors": (self.stats(9, 400.0, errors=1), False),
+            "more timeouts": (self.stats(9, 400.0, timeouts=1), False),
         }
         for label, (treatment, met) in cases.items():
             result = self.decide(base, treatment)
             self.assertEqual(result["status"], "evaluated", label)
             self.assertIs(result["met"], met, label)
         # errors/timeouts equal to control's are not a regression
-        both = self.decide(self.stats(6, 20.0, 1, 1), self.stats(9, 40.0, 1, 1))
+        both = self.decide(self.stats(6, 1000.0, 1, 1), self.stats(9, 400.0, 1, 1))
         self.assertIs(both["met"], True)
+
+    def test_display_rounding_cannot_decide(self):
+        # 3600*s/wall: control 4.004/h, treatment 5.004/h. Both display as
+        # 4.00 and 5.00 (ratio 1.25 when rounded) but the true ratio is 1.24975.
+        control = controller.summarize(
+            [{"run_successful": True, "total_wall_s": 3600 / 4.004}]
+        )
+        treatment = controller.summarize(
+            [{"run_successful": True, "total_wall_s": 3600 / 5.004}]
+        )
+        self.assertEqual(control["verified_tasks_per_hour"], 4.0)
+        self.assertEqual(treatment["verified_tasks_per_hour"], 5.0)
+        result = self.decide(control, treatment)
+        self.assertIs(result["met"], False)
+        self.assertLess(result["ratio_exact"], 1.25)
+        # the clean twin: a real 1.25x passes
+        passing = controller.summarize(
+            [{"run_successful": True, "total_wall_s": 3600 / 5.005}]
+        )
+        self.assertIs(self.decide(control, passing)["met"], True)
 
     def test_zero_recorded_wall_time_is_reported_not_raised(self):
         for control, treatment in [
-            (self.stats(3, None), self.stats(3, 10.0)),
-            (self.stats(3, 10.0), self.stats(3, None)),
-            (self.stats(3, 10.0), self.stats(0, None)),
+            (self.stats(3, 0.0), self.stats(3, 100.0)),
+            (self.stats(3, 100.0), self.stats(3, 0.0)),
+            (self.stats(3, 100.0), self.stats(0, 0.0)),
         ]:
             result = self.decide(control, treatment)
             self.assertEqual(result["status"], "ratio_undefined")
@@ -552,7 +652,7 @@ FAKE_LAUNCHER = textwrap.dedent(
     stage = args[args.index("--run-dir") + 1]
     seed = args[args.index("--seed") + 1]
     task = args[args.index("--task") + 1]
-    shutil.copytree(f"{records}/{arm}/seed{seed}/{task}", stage)
+    shutil.copytree(f"{records}/{arm}/seed{seed}/{task}", stage, dirs_exist_ok=True)
     if mode == "bad-prompt":
         import json
         p = os.path.join(stage, "exp2_policy.json")
@@ -626,6 +726,38 @@ class TestRun(Scratch):
         # re-running must not silently re-roll the failed attempt
         self.assertEqual(controller.run(self.runnable(), self.runs, live=False), 2)
         self.assertFalse(os.path.exists(self.cell(last)))
+
+    def silent_launcher(self, counter: str) -> dict[str, Any]:
+        """An arm whose launcher counts its calls and writes nothing."""
+        script = os.path.join(self.tmp, "silent.py")
+        with open(script, "w") as f:
+            f.write(f"import sys\nopen({counter!r}, 'a').write('x')\nsys.exit(1)\n")
+        m = self.runnable()
+        last = ("verification", 44, "refactor-validators")
+        shutil.rmtree(self.cell(last))
+        m["arms"]["verification"]["launch"] = [sys.executable, script]
+        return m
+
+    def test_launcher_that_writes_nothing_cannot_be_silently_retried(self):
+        counter = os.path.join(self.tmp, "calls")
+        m = self.silent_launcher(counter)
+        last = ("verification", 44, "refactor-validators")
+        self.assertEqual(controller.run(m, self.runs, live=False), 3)
+        self.assertEqual(pathlib.Path(counter).read_text(), "x")
+        self.assertTrue(os.path.isdir(self.cell(last) + ".partial"))
+        # the second invocation must refuse, not launch again
+        self.assertEqual(controller.run(m, self.runs, live=False), 2)
+        self.assertEqual(pathlib.Path(counter).read_text(), "x")
+
+    def test_launcher_that_cannot_start_leaves_evidence(self):
+        m = self.runnable()
+        last = ("verification", 44, "refactor-validators")
+        shutil.rmtree(self.cell(last))
+        m["arms"]["verification"]["launch"] = [os.path.join(self.tmp, "no-such-bin")]
+        self.assertEqual(controller.run(m, self.runs, live=False), 3)
+        note = pathlib.Path(self.cell(last) + ".partial", "controller-note.txt")
+        self.assertIn("could not start", note.read_text())
+        self.assertEqual(controller.run(m, self.runs, live=False), 2)
 
     def test_directory_without_a_result_is_refused_before_launching(self):
         last = ("verification", 44, "refactor-validators")
