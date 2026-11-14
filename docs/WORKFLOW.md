@@ -62,14 +62,37 @@ hours or overwrite experiment records.
   person files them under `<runs>/aborted/` (ignored by the matrix, kept as
   evidence), so a failed attempt is never silently re-rolled. Only the manifest's
   arm directories are policed; `aborted/`, `logs/` etc. beside them are not.
-  Each arm needs a `launch` entry that writes the provenance file (as
-  `exp2_entry` does); plain `bench.py` writes none and is refused.
+  An arm may name its own `launch` entry (which must write the provenance
+  file, as `exp2_entry` does); otherwise the generic launcher is used. Plain
+  `bench.py` is never launched directly.
 - `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).
   `experiments/exp2_records/` holds byte copies of its 36 `config.json`,
   `exp2_policy.json` and `results.json` (hashes in `SHA256SUMS`; `env.json` and
   transcripts stay in the ignored `runs/`). Tests reproduce 6/18 vs 9/18 and
   1.51x from them; with `runs/exp2` (or `EXP2_RUNS`) present they also check the
   copies match the originals, otherwise that check reports SKIPPED.
+- **Code identity (run-only).** A runnable manifest registers
+  `benchmark.tag`, the full `commit`, `source_files` (engine, classifier,
+  telemetry, package init) and `source_sha256` (digest over those files plus the
+  suite manifest); `python -m experiments.source_identity TAG SUITE FILES...`
+  computes them from the tag's objects. `verify` / `run` fail closed unless the
+  files on disk hash to that digest, each selected task matches its suite pin,
+  no source file is a symlink or missing, the tag resolves to the registered
+  commit, and each file and task is byte-identical to the object at that
+  commit. The checkout's HEAD is irrelevant (newer controller code may run a
+  frozen benchmark). `check`, `plan` and `analyze` stay offline and never need
+  the tag. Needs the tag: `git fetch --tags`.
+- **Generic launcher** (`experiments/launcher.py`) starts any arm without its
+  own `launch`. Before a model call it re-checks the bench arguments, the code
+  identity, that the loaded engine modules are the verified files, the model's
+  manifest/config/weights digests, and that the arm's prompt (engine base prompt
+  plus the manifest's `prompt_edit`, applied exactly once) hashes to the pinned
+  `prompt_sha256` and `system_prompt_sha256`. A failure leaves
+  `launch-refused.json` and exits 4 with the engine not started. Then it runs
+  the unchanged engine behind a recorder that hashes the system message of every
+  request that reaches the model call; only if every request carried the pinned
+  prompt (and at least one was made) does it write `provenance.json`. Otherwise
+  `launch-failed.json` is written and the attempt is quarantined.
 - Limits: `run` has not been exercised against a live model; the decision rule
   compares only inference errors and timeouts, as the protocol words it.
 

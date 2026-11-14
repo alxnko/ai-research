@@ -17,7 +17,9 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from typing import Any
 from unittest import mock
@@ -216,6 +218,28 @@ class TestSourceIdentity(TempRepo):
         m = copy.deepcopy(self.manifest)
         del m["benchmark"]["source_sha256"]
         self.assertTrue(any("no source identity" in p for p in self.problems(m)))
+
+    def test_task_missing_from_the_suite_is_detected(self):
+        m = copy.deepcopy(self.manifest)
+        m["tasks"] = ["t1", "t2"]
+        self.assertTrue(any("'t2' is not in the suite" in p for p in self.problems(m)))
+
+    def test_release_whose_own_pin_disagrees_with_its_task_is_detected(self):
+        # disk matches the pin, but the tagged task bytes do not: only the
+        # comparison against the tag's task objects can see this
+        self.put("bench/tasks/t1/tests/test_a.py", "ASSERT = 2\n")
+        new = source_identity.dir_digest(os.path.join(self.root, "bench/tasks/t1"))
+        self.put(
+            "bench/suites/s.json", json.dumps({"suite": "s", "tasks": {"t1": new}})
+        )
+        git(self.root, "add", "bench/suites/s.json")  # the task file stays unstaged
+        git(self.root, "commit", "-q", "-m", "inconsistent release")
+        git(self.root, "tag", "-f", "-a", "vT", "-m", "inconsistent")
+        reg = source_identity.registration("vT", "s", SOURCE_FILES, self.root)
+        m = {"benchmark": {"tag": "vT", "suite": "s", **reg}, "tasks": ["t1"]}
+        found = self.problems(m)
+        self.assertEqual(found, ["task 't1' at the tag differs from the suite pin"])
+        self.assertEqual(self.problems(m, use_git=False), [])
 
     def test_dir_digest_matches_the_engine_algorithm(self):
         task = os.path.join(controller.ROOT, "bench", "tasks", TASK)
@@ -440,6 +464,16 @@ class TestEndToEnd(Release):
             check=False,
         )
         self.assertEqual(proc.returncode, launcher.REFUSED)
+
+    def test_shadowed_engine_module_is_detected(self):
+        m = self.manifest()
+        argv = controller.bench_argv(m, 42, TASK)
+        clean, _ = launcher.pre_inference_problems(m, "control", argv)
+        self.assertEqual(clean, [])
+        fake = types.SimpleNamespace(__file__="/somewhere/else/classifier.py")
+        with mock.patch.dict(sys.modules, {"bench.classifier": fake}):
+            shadowed, _ = launcher.pre_inference_problems(m, "control", argv)
+        self.assertTrue(any("bench.classifier was loaded from" in p for p in shadowed))
 
     def test_frozen_manifest_cannot_be_launched(self):
         m = self.manifest()
