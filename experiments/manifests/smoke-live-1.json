@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "experiment": "SMOKE-LIVE-1",
+  "frozen": false,
+  "inference": "ollama",
+  "benchmark": {
+    "tag": "v0.5",
+    "suite": "v0.5",
+    "commit": "c027a89c132cb5d95f35d2db7b91054d4e29bcc1",
+    "source_files": [
+      "bench/__init__.py",
+      "bench/bench.py",
+      "bench/classifier.py",
+      "bench/telemetry.py"
+    ],
+    "source_sha256": "77c714c7856cec3c366c2045bccd976ac7da302d7cc055fe540cb5edaa475a70"
+  },
+  "tasks": [
+    "debugging-off-by-one"
+  ],
+  "seeds": [
+    42
+  ],
+  "arms": {
+    "control": {
+      "prompt_sha256": "e3e28dd726bf3ed6052fbfe84ae1e5d75dab360e784aabe7f9f974bc3ac8f073",
+      "system_prompt_sha256": "42ed682c241afe29dd1cd1fb536f76a4b1e4b14370bd9467ddc424a230ce0a91"
+    }
+  },
+  "model": {
+    "tag": "qwen3.5:4b-q4_K_M",
+    "manifest_digest": "sha256:d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04",
+    "config_digest": "sha256:788a4d94bc3f431ac0cd067005be4b838a09330427962952420b05d10ecf84db",
+    "weights_digest": "sha256:a9d0a3e1d8c91732a3812becd31f8d4a8ff57414903f226306069f0437e2ac50"
+  },
+  "settings": {
+    "actuator": "native_tools",
+    "ctx": 8192,
+    "ngpu": 99,
+    "steps": 6,
+    "max_wall": 180,
+    "strict_isolation": true,
+    "sampling": {
+      "profile": "exp2-coding-v1",
+      "version": "v1",
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "repeat_penalty": 1.0
+    }
+  },
+  "runs_dir": "runs/smoke-live-1",
+  "provenance_file": "provenance.json"
+}
