@@ -213,6 +213,7 @@ def validate_manifest(m: Any) -> list[str]:
         "provenance_file",
         "integrity",
         "inference",
+        "analysis",  # required for two or more arms, checked below
     }  # frozen: fail closed
     for key in sorted(required - set(m)):
         errors.append(f"{key}: missing")
@@ -259,15 +260,21 @@ def validate_manifest(m: Any) -> list[str]:
         if extra:
             errors.append(f"arms.{name}: unknown keys {sorted(extra)}")
         _arm_problems(m, name, arm, errors)
-    analysis = m["analysis"]
-    if set(analysis) != {"control", "treatment", "min_ratio"}:
+    analysis = m.get("analysis")
+    if analysis is None:
+        # a decision compares two arms; only a single-arm run (an infrastructure
+        # smoke test) may register none
+        if len(m["arms"]) != 1:
+            errors.append("analysis: missing (required unless there is one arm)")
+        analysis = {}
+    elif set(analysis) != {"control", "treatment", "min_ratio"}:
         errors.append("analysis: needs exactly control, treatment, min_ratio")
     elif not {analysis["control"], analysis["treatment"]} <= set(m["arms"]):
         errors.append("analysis: control/treatment must name arms")
     elif analysis["control"] == analysis["treatment"]:
         errors.append("analysis: control and treatment must differ")
     ratio = analysis.get("min_ratio")
-    if not (
+    if analysis and not (
         isinstance(ratio, int | float)
         and not isinstance(ratio, bool)
         and math.isfinite(ratio)
@@ -710,7 +717,13 @@ def decide(
     manifest: dict[str, Any], stats: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
     """The registered rule, with every degenerate case spelled out."""
-    spec = manifest["analysis"]
+    spec = manifest.get("analysis")
+    if spec is None:
+        return {
+            "status": "not-registered",
+            "met": None,
+            "reason": "no decision rule is registered (single-arm run)",
+        }
     c, t = stats[spec["control"]], stats[spec["treatment"]]
     if c["successes"] == 0 and t["successes"] == 0:
         return {

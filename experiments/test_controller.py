@@ -271,6 +271,18 @@ class TestManifestSchema(unittest.TestCase):
             change(m)
             self.assertTrue(controller.validate_manifest(m), label)
 
+    def test_a_decision_rule_is_optional_only_for_a_single_arm(self):
+        m = copy.deepcopy(manifest())
+        m.pop("analysis")
+        self.assertTrue(controller.validate_manifest(m))  # two arms need a rule
+        m["arms"].pop("verification")
+        self.assertEqual(controller.validate_manifest(m), [])
+        found = controller.decide(m, {"control": {}})
+        self.assertEqual((found["status"], found["met"]), ("not-registered", None))
+        m["analysis"] = {"control": "control", "treatment": "control", "min_ratio": 0}
+        found = controller.validate_manifest(m)  # a given rule stays checked
+        self.assertTrue(any("min_ratio" in e for e in found), found)
+
 
 class TestManifestRobustness(unittest.TestCase):
     JUNK = ({}, [], [{}], [[]], None, 1, "x", True, float("nan"), {"a": 1})
