@@ -62,9 +62,8 @@ hours or overwrite experiment records.
   person files them under `<runs>/aborted/` (ignored by the matrix, kept as
   evidence), so a failed attempt is never silently re-rolled. Only the manifest's
   arm directories are policed; `aborted/`, `logs/` etc. beside them are not.
-  An arm may name its own `launch` entry (which must write the provenance
-  file, as `exp2_entry` does); otherwise the generic launcher is used. Plain
-  `bench.py` is never launched directly.
+  Every attempt goes through the generic launcher (below); a manifest cannot
+  name another one. Plain `bench.py` is never launched directly.
 - `experiments/manifests/exp2.json` describes frozen EXP-2 (analysis only).
   `experiments/exp2_records/` holds byte copies of its 36 `config.json`,
   `exp2_policy.json` and `results.json` (hashes in `SHA256SUMS`; `env.json` and

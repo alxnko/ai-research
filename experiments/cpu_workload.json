@@ -1,0 +1,32 @@
+{
+  "suite": "v0.5",
+  "split_rule": "tasks sorted by id within category (backend, debug, devops, frontend, mobile, refactor); even positions calibration, odd positions final",
+  "calibration": [
+    "backend-auth-token",
+    "backend-idempotency-v2",
+    "backend-rate-limit",
+    "debug-tz-offset",
+    "debugging-money-round-v2",
+    "debugging-unicode-sort",
+    "devops-deploy-script",
+    "devops-log-rotate",
+    "frontend-query-string",
+    "frontend-validation",
+    "mobile-conflict-merge",
+    "mobile-sync-queue",
+    "refactor-parser",
+    "refactor-shipping"
+  ],
+  "final": [
+    "backend-csv-import",
+    "backend-pagination",
+    "backend-webhook-hmac",
+    "debugging-default-arg",
+    "debugging-off-by-one",
+    "devops-healthcheck",
+    "frontend-theme-vars",
+    "mobile-deeplink",
+    "refactor-phone",
+    "refactor-validators"
+  ]
+}
