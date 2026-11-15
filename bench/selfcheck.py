@@ -49,7 +49,7 @@ from bench.telemetry import (
     summarize_inference,
 )
 from bench.validator_selftest import validator_selftests
-from experiments import test_controller
+from experiments import test_controller, test_launcher
 
 
 def parser_checks() -> list[tuple[str, str, str]]:
@@ -1891,11 +1891,13 @@ def check_task(
 
 
 def controller_tests() -> list[tuple[str, str, str]]:
-    """Run the offline experiment-controller tests (experiments/test_controller.py)."""
+    """Run the offline controller and launcher tests (experiments/test_*.py)."""
     stream = io.StringIO()
-    result = unittest.TextTestRunner(stream=stream, verbosity=0).run(
-        unittest.defaultTestLoader.loadTestsFromModule(test_controller)
+    suite = unittest.TestSuite(
+        unittest.defaultTestLoader.loadTestsFromModule(module)
+        for module in (test_controller, test_launcher)
     )
+    result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
     for test, _reason in result.skipped:
         print(f"SKIPPED (not verified): {test.id()}")
     return [
