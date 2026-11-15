@@ -49,7 +49,7 @@ from bench.telemetry import (
     summarize_inference,
 )
 from bench.validator_selftest import validator_selftests
-from experiments import test_controller, test_launcher
+from experiments import test_controller, test_launcher, test_server_identity
 
 
 def parser_checks() -> list[tuple[str, str, str]]:
@@ -1895,7 +1895,7 @@ def controller_tests() -> list[tuple[str, str, str]]:
     stream = io.StringIO()
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromModule(module)
-        for module in (test_controller, test_launcher)
+        for module in (test_controller, test_launcher, test_server_identity)
     )
     result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
     for test, _reason in result.skipped:

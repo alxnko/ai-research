@@ -23,7 +23,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from experiments import analyze_exp2, controller
+from experiments import analyze_exp2, controller, server_identity
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(HERE, "manifests", "exp2.json")
@@ -71,6 +71,19 @@ def write_transcript(cell: str, text: str = SYSTEM_TEXT) -> None:
     path.write_text(json.dumps({"steps": [{"role": "system", "content": text}]}))
 
 
+def server_record() -> dict[str, Any]:
+    digest = server_identity.normalise_digest(manifest()["model"]["manifest_digest"])
+    return {
+        "instance": server_identity.BASE,
+        "attestation": server_identity.ATTESTATION,
+        "advertised_digest": digest,
+        "loaded_digest": digest,
+        "loaded_context": manifest()["settings"]["ctx"],
+        "loaded_size_vram": 1,
+        "loaded_checks": 1,
+    }
+
+
 def launcher_fields(m: dict[str, Any], key: tuple[str, int, str]) -> dict[str, Any]:
     """What the generic launcher adds to a provenance record."""
     return {
@@ -79,6 +92,7 @@ def launcher_fields(m: dict[str, Any], key: tuple[str, int, str]) -> dict[str, A
         "source_sha256": SOURCE_PIN,
         "source_verification": "git+filesystem",
         "inference_backend": "ollama",
+        "server_identity": server_record(),
         "attempt_id": controller.attempt_id(m, *key),
     }
 
@@ -641,6 +655,53 @@ class TestLauncherProvenance(Scratch):
         pathlib.Path(policy).write_text(json.dumps(good))
         self.bless()
         self.assertEqual(self.problems(), [])
+
+    def test_each_server_identity_defect_is_detected(self):
+        policy = os.path.join(self.cell(), "exp2_policy.json")
+        good = json.loads(pathlib.Path(policy).read_text())
+        srv = good["server_identity"]
+        other = "sha256:" + "5" * 64
+        defects = {
+            "no server evidence": None,
+            "server evidence not an object": "ok",
+            "another instance": {**srv, "instance": "http://127.0.0.1:9"},
+            "claims attestation": {**srv, "attestation": "attested"},
+            "advertised another model": {**srv, "advertised_digest": other},
+            "loaded another model": {**srv, "loaded_digest": other},
+            "loaded another context": {**srv, "loaded_context": 4096},
+            "a call was not checked": {**srv, "loaded_checks": 0},
+            "checks as text": {**srv, "loaded_checks": "1"},
+        }
+        for label, change in defects.items():
+            pathlib.Path(policy).write_text(
+                json.dumps({**good, "server_identity": change})
+            )
+            self.bless()
+            found = self.problems()
+            self.assertTrue(any("server" in p for p in found), f"{label}: {found}")
+            self.assertFalse(any("recorded hash" in p for p in found), label)
+        pathlib.Path(policy).write_text(
+            json.dumps({k: v for k, v in good.items() if k != "server_identity"})
+        )
+        self.bless()
+        self.assertTrue(any("server" in p for p in self.problems()))
+        pathlib.Path(policy).write_text(json.dumps(good))
+        self.bless()
+        self.assertEqual(self.problems(), [])
+
+    def test_a_mock_experiment_needs_no_server_evidence(self):
+        mock_m = {**self.m, "inference": "mock"}
+        edit(
+            os.path.join(self.cell(), "exp2_policy.json"),
+            lambda d: d.update(
+                launcher_fields(mock_m, CELL),
+                inference_backend="mock",
+                server_identity=None,
+            ),
+        )
+        controller._write_attempt(mock_m, CELL, self.cell(), durable=False)
+        found = controller.validate_attempt(mock_m, *CELL, self.cell())
+        self.assertEqual(found, [])
 
 
 class TestDecisionRule(unittest.TestCase):

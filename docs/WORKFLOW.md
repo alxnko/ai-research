@@ -109,9 +109,33 @@ hours or overwrite experiment records.
 - **Coupling.** A runnable manifest executes the registered release: once
   `bench/*.py` legitimately changes on `main`, tag a new benchmark version and
   register a new manifest (and the launcher tests' `v0.5` reference) rather than
-  editing in place. Known limit: the model fingerprint is read from the local
-  Ollama store, not from the running server.
-- Limits: `run` has not been exercised against a live model; the decision rule
+  editing in place.
+- **Server-side model identity** (`experiments/server_identity.py`, real
+  backend only). The local store fingerprint above says what is on disk, not what
+  the serving process has loaded, so the launcher also asks the server:
+  `GET /api/tags` before inference must list exactly one entry for the tag
+  whose `digest` is the registered manifest digest (the server's bare hex and
+  the manifest's `sha256:` form are normalised and compared in full; the 12-char
+  id is rejected); `GET /api/ps` after *every* model call (retries included)
+  must show exactly one loaded entry for the tag with the same digest and a
+  `context_length` equal to the experiment's `ctx`; both are repeated when the
+  engine returns, and every digest observed must be identical, so a model
+  re-pulled or swapped mid-attempt fails it. A refusal before inference exits 4;
+  a failure afterwards leaves `launch-failed.json` and no `provenance.json`, so
+  the attempt is quarantined. Unreachable endpoints, malformed bodies, missing,
+  duplicated or non-matching entries, and a missing digest or context all fail
+  closed; the local fingerprint is never a fallback. The inspected address must
+  equal the address the engine's `chat_stream` sends to (read from its `url`
+  default at run time); `OLLAMA_HOST` configures the server and the CLI, not the
+  engine's client. `provenance.json` records `server_identity` (instance,
+  advertised and loaded digests, loaded context and VRAM, one check per model
+  call) and the controller requires it, consistent with the manifest, for every
+  non-mock record. `verify --live` and `run` preflight also query `/api/tags`.
+  **Not attestation:** Ollama reports a manifest digest and its loaded set; this
+  is consistency evidence for the advertised identity, not proof of the weights
+  behind any one request. Models loaded by other clients between two checks
+  could in principle be missed.
+- Limits: the decision rule
   compares only inference errors and timeouts, as the protocol words it.
 
 ## Harness and scorer changes
