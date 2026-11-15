@@ -33,14 +33,36 @@ verification and monitor-overhead seconds, and the engine's total, so
 Per group: median, p95 (nearest rank), min, max, execution failures. Batch
 level: workflows per hour at 1, 2 and 4 workers (never more than 4).
 
-## Correctness gate
-Every repetition must solve its task (`passed` and `run_successful`); a
-failure is an *execution failure* and fails the run. Each repetition also yields
-a canonical digest of its deterministic outputs (task, fixture digest, outcome,
-changed/added/removed files, commands, turns, tool calls, tokens). Repetitions
-of a task must agree. The summary stores the per-task reference digests; any
-later, optimised version must reproduce them exactly. Faster by doing less is
-not an optimisation.
+## Correctness gate and validity
+A repetition counts only if all of these hold:
+1. the child process exited 0 and was not killed by the per-run timeout
+   (300 s; a killed run is recorded, never dropped);
+2. the engine reports the task solved;
+3. three things measured **on disk** match an *independent reference* built by
+   the tool from the pinned fixtures, without the engine's scorer or sandbox:
+   the produced workspace (tree digest) equals the pristine repo with the
+   reference solution applied; the hidden tests installed in the scoring copy
+   equal the task's pinned tests; and the engine's verification output equals
+   (timings removed) the output of one independent run of the task's test
+   command on that reference. The task fixture digest must equal the suite pin;
+4. every deterministic field is present (a missing or null field is a failure,
+   never hashed as `None`).
+
+Each passing repetition yields a canonical digest over those fields plus the
+engine's outcome, file lists, commands, turns, tool calls and tokens. The
+**invocation is valid only if** the whole requested matrix completed (every
+task x repetition x worker count), no repetition failed, every task has exactly
+one digest across all repetitions *and all worker counts*, the CPU budget was
+not exceeded, and the independent reference itself passed. Otherwise the tool
+exits non-zero, `summary.json` says `valid: false` and lists the problems, and
+the raw measurements are kept. A failed attempt keeps its run directory and
+child log under `<out>/failed/`.
+
+What this does and does not show: an optimisation that skipped part of
+verification would change the verification output or the installed hidden
+tests and be caught; one that left the workspace and verification evidence
+identical and merely ran faster passes, which is the intent. It does not prove
+the sandbox's isolation properties are unchanged (those have their own tests).
 
 ## Procedure and budget
 1. **Calibration** (this PR): `run --set calibration --reps 5 --workers 1 2 4`.
@@ -49,9 +71,15 @@ not an optimisation.
    started by accident. It is measured only when a single-variable optimisation
    has been registered, as an interleaved baseline/optimised pair on the same
    machine state, with a stated minimum improvement and number of repetitions.
-3. Budget: at most 20 minutes of CPU time in total (enforced by the tool: no run
-   starts once the spent CPU reaches it, and the stop is recorded), at most 4
-   concurrent workers, no inference, no GPU compute.
+3. Budget: at most 20 minutes of CPU time, at most 4 concurrent workers, no
+   inference, no GPU compute. The CPU budget is **admission control, not a hard
+   cap**: before each wave the tool stops if the CPU already spent plus the
+   worst per-run CPU seen so far times the wave size would reach it. A wave in
+   flight is never killed (that would discard evidence), so overshoot is bounded
+   by one wave; any overshoot is reported as a problem and makes the invocation
+   invalid. The budget covers the measured benchmark process trees, not the
+   tool's own hashing and the independent reference runs. `--cpu-budget` is
+   limited to (0, 1200].
 4. Stop rules: an execution failure or a non-reproducible digest stops
    interpretation until explained; a budget stop is reported, never hidden.
 

@@ -14,9 +14,25 @@ Every repetition is a fresh process running the unchanged engine's `main()`
 (the way the controller starts an attempt), measured from outside with
 `wait4`: wall time, user and system CPU of the whole process tree and the peak
 resident set of its largest process. Per-phase times (agent, verification,
-monitor) come from the engine's own result row. Each run also yields a canonical
-digest of its deterministic outputs; repetitions and later (optimised) versions
-must agree on it, so "faster" can never mean "did less".
+monitor) come from the engine's own result row.
+
+Integrity. A run counts only if (1) the child exited 0 and did not time out,
+(2) the engine reports the task solved, (3) the produced workspace, the hidden
+tests installed in the scoring copy, and the engine's verification output all
+match an *independent reference* built here from the pinned fixtures (the
+reference solution applied to the pristine repo, the task's tests, and one
+independent run of the task's test command), and (4) every deterministic field
+is present. The whole invocation is valid only if the full requested matrix
+completed, no run failed, and every task has one single digest across all
+repetitions and all worker counts. Failed attempts keep their run directory
+and log under `<out>/failed/`.
+
+CPU budget: *admission control*, not a hard cap. Before each wave the tool
+stops if the CPU already spent plus the worst per-run CPU seen so far times the
+wave size would reach the budget; a wave in flight is never killed (that would
+discard its evidence), so overshoot is bounded by one wave and, if it happens,
+is reported as a problem. The budget covers the measured benchmark process
+trees, not this tool's own hashing and the independent reference runs.
 
 Nothing here edits the benchmark or its records. Output goes under a directory
 the caller names (default `runs/cpu-profile/`, which is gitignored).
@@ -26,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -33,11 +50,14 @@ import math
 import os
 import pathlib
 import platform
+import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -49,10 +69,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKLOAD = os.path.join(ROOT, "experiments", "cpu_workload.json")
 MAX_WORKERS = 4
 CPU_BUDGET_S = 1200.0  # protocol: 20 minutes of CPU time
+CHILD_TIMEOUT_S = 300.0  # a hung child is killed, recorded and kept as evidence
 STEPS = 6
 MODEL = "qwen3.5:4b-q4_K_M"  # only names the local store entry; never contacted
+TREE_SKIP = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".bench_out"}
 
 # What a repetition must reproduce exactly (nothing timing- or path-dependent).
+# The last three are measured on disk here, not taken from the engine's row.
 DETERMINISTIC = (
     "task",
     "task_digest",
@@ -69,12 +92,48 @@ DETERMINISTIC = (
     "tool_calls",
     "invalid_actions",
     "tokens",
+    "work_sha256",
+    "hidden_sha256",
+    "verification_evidence_sha256",
 )
 
 
-def canonical_digest(row: dict[str, Any]) -> str:
-    keep = {k: row.get(k) for k in DETERMINISTIC}
+def missing_fields(row: dict[str, Any]) -> list[str]:
+    return [k for k in DETERMINISTIC if k not in row or row[k] is None]
+
+
+def canonical_digest(row: dict[str, Any]) -> str | None:
+    """None when any required field is absent: nothing is hashed as `None`."""
+    if missing_fields(row):
+        return None
+    keep = {k: row[k] for k in DETERMINISTIC}
     return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()
+
+
+def tree_digest(root: str) -> str:
+    """Content and layout of a tree (symlinks hashed as links, never followed)."""
+    h = hashlib.sha256()
+    for dirpath, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in TREE_SKIP)
+        for name in sorted(files):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).encode()
+            if os.path.islink(full):
+                h.update(b"L" + rel + os.readlink(full).encode())
+            else:
+                with open(full, "rb") as f:
+                    h.update(b"F" + rel + f.read())
+    return h.hexdigest()
+
+
+_TIMING = re.compile(r"\bin \d+(\.\d+)?s\b")
+
+
+def evidence_digest(output: str) -> str:
+    """Hash of a test run's output with timings removed: the same tests ran and
+    reported the same result."""
+    lines = [_TIMING.sub("in Xs", ln).strip() for ln in output.splitlines()]
+    return hashlib.sha256("\n".join(ln for ln in lines if ln).encode()).hexdigest()
 
 
 def nearest_rank(values: list[float], q: float) -> float:
@@ -107,6 +166,57 @@ def workload_problems(doc: dict[str, Any], suite: dict[str, Any]) -> list[str]:
     if len(cal) != len(doc["calibration"]) or len(fin) != len(doc["final"]):
         problems.append("duplicate task in a set")
     return problems
+
+
+# ------------------------------------------------------- independent reference
+
+
+def staged_solution(task_id: str, dest: str) -> str:
+    """The pristine repo with the reference solution applied (no engine code)."""
+    tdir = os.path.join(engine.TASKS, task_id)
+    work = os.path.join(dest, "work")
+    shutil.copytree(os.path.join(tdir, "repo"), work)
+    shutil.copytree(os.path.join(tdir, "solution"), work, dirs_exist_ok=True)
+    return work
+
+
+def reference(task_id: str, scratch: str) -> dict[str, Any]:
+    """What a correct attempt must leave behind, derived without the engine's
+    scoring or sandbox: expected workspace, expected hidden tests as installed in
+    the scoring copy, and the output of one independent run of the task's tests."""
+    meta = engine.load_task(task_id)
+    dest = tempfile.mkdtemp(prefix=f"ref-{task_id}-", dir=scratch)
+    work = staged_solution(task_id, dest)
+    ref: dict[str, Any] = {"work_sha256": tree_digest(work)}
+    hidden = os.path.join(work, "_hidden")
+    shutil.copytree(os.path.join(engine.TASKS, task_id, "tests"), hidden)
+    pathlib.Path(hidden, "__init__.py").touch()  # as the scorer installs them
+    ref["hidden_sha256"] = tree_digest(hidden)
+    try:
+        done = subprocess.run(
+            ["sh", "-c", meta["test_cmd"]],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            timeout=meta.get("timeout_s", meta.get("test_timeout_s", 120)),
+            check=False,
+        )
+        ref["tests_exit"] = done.returncode
+        ref["verification_evidence_sha256"] = evidence_digest(
+            (done.stdout + done.stderr).strip()
+        )
+    except subprocess.TimeoutExpired:
+        ref["tests_exit"] = None
+        ref["verification_evidence_sha256"] = None
+    ref["task_digest"] = engine.load_suite("v0.5")["tasks"][task_id]
+    shutil.rmtree(dest, ignore_errors=True)
+    return ref
+
+
+def reference_problems(task_id: str, ref: dict[str, Any]) -> list[str]:
+    if ref["tests_exit"] != 0:
+        return [f"{task_id}: the independent test run did not pass on the solution"]
+    return []
 
 
 # --------------------------------------------------------------- scripted actor
@@ -172,29 +282,50 @@ def one_main(argv: list[str]) -> int:
 
 
 def measure_child(
-    task: str, run_dir: str, *, strict: bool
-) -> tuple[dict[str, Any], int]:
-    """Run one child and measure it from outside (wait4 covers its descendants)."""
+    task: str, run_dir: str, *, strict: bool, log: str, timeout_s: float
+) -> tuple[dict[str, Any], int, bool]:
+    """Run one child and measure it from outside (wait4 covers its descendants).
+    A child past `timeout_s` is killed (its process group) and flagged; its
+    directory and log are kept by the caller."""
     cmd = [sys.executable, "-m", "experiments.cpu_profile", "one"]
     cmd += ["--task", task, "--run-dir", run_dir]
     if not strict:
         cmd.append("--no-strict-isolation")
     t0 = time.perf_counter()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    _, status, usage = os.wait4(proc.pid, 0)
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(
+            cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        timed_out = threading.Event()
+
+        def kill() -> None:
+            timed_out.set()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+        timer = threading.Timer(timeout_s, kill)
+        timer.start()
+        try:
+            _, status, usage = os.wait4(proc.pid, 0)
+        finally:
+            timer.cancel()
     wall = time.perf_counter() - t0
     proc.returncode = os.waitstatus_to_exitcode(status)
-    return {
-        "wall_s": wall,
-        "user_s": usage.ru_utime,
-        "sys_s": usage.ru_stime,
-        "maxrss_kib": usage.ru_maxrss,
-    }, proc.returncode
+    return (
+        {
+            "wall_s": wall,
+            "user_s": usage.ru_utime,
+            "sys_s": usage.ru_stime,
+            "maxrss_kib": usage.ru_maxrss,
+        },
+        proc.returncode,
+        timed_out.is_set(),
+    )
+
+
+def find_attempt(run_dir: str, task: str) -> str | None:
+    path = os.path.join(run_dir, "r0", task)
+    return path if os.path.isdir(path) else None
 
 
 def read_row(run_dir: str) -> dict[str, Any] | None:
@@ -215,6 +346,9 @@ class Plan:
     strict: bool
     budget_s: float
     spent_s: float = 0.0
+    failed_dir: str | None = None
+    refs: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    child_timeout_s: float = CHILD_TIMEOUT_S
 
 
 def is_ok(row: dict[str, Any] | None) -> bool:
@@ -222,14 +356,74 @@ def is_ok(row: dict[str, Any] | None) -> bool:
     return bool(row and row.get("passed") is True and row.get("run_successful") is True)
 
 
+def disk_evidence(run_dir: str, task: str) -> dict[str, Any]:
+    """Measured from the files the attempt left behind, not from the engine's row."""
+    base = find_attempt(run_dir, task)
+    if base is None:
+        return {}
+    out: dict[str, Any] = {}
+    work = os.path.join(base, "work")
+    hidden = os.path.join(base, "score", "_hidden")
+    if os.path.isdir(work):
+        out["work_sha256"] = tree_digest(work)
+    if os.path.isdir(hidden):
+        out["hidden_sha256"] = tree_digest(hidden)
+    try:
+        text = pathlib.Path(base, "test_output.txt").read_text(encoding="utf-8")
+        out["verification_evidence_sha256"] = evidence_digest(text.strip())
+    except OSError:
+        pass
+    return out
+
+
+def integrity_problems(
+    row: dict[str, Any] | None, evidence: dict[str, Any], ref: dict[str, Any] | None
+) -> list[str]:
+    if not row:
+        return ["no readable results row"]
+    full = {**row, **evidence}
+    problems = [f"missing field {k}" for k in missing_fields(full)]
+    if not is_ok(row):
+        problems.append("the engine did not report the task solved")
+    if ref is None:
+        return [*problems, "no independent reference for this task"]
+    for key in ("work_sha256", "hidden_sha256", "verification_evidence_sha256"):
+        if key in evidence and evidence[key] != ref.get(key):
+            problems.append(f"{key} differs from the independent reference")
+    if row.get("task_digest") != ref.get("task_digest"):
+        problems.append("task fixture digest differs from the suite pin")
+    return problems
+
+
 def record(plan: Plan, task: str, rep: int, scratch: str) -> dict[str, Any]:
     label, workers = plan.label, plan.workers
-    run_dir = os.path.join(scratch, f"{task}-{rep}-{workers}")
-    outer, code = measure_child(task, run_dir, strict=plan.strict)
+    name = f"{task}-{rep}-{workers}"
+    run_dir = os.path.join(scratch, name)
+    log = os.path.join(scratch, f"{name}.log")
+    outer, code, timed_out = measure_child(
+        task, run_dir, strict=plan.strict, log=log, timeout_s=plan.child_timeout_s
+    )
     row = read_row(run_dir)
-    shutil.rmtree(run_dir, ignore_errors=True)
     inner = row or {}
-    ok = is_ok(row)
+    evidence = disk_evidence(run_dir, task)
+    problems = integrity_problems(row, evidence, plan.refs.get(task))
+    if code != 0:
+        problems.append(f"the child exited with status {code}")
+    if timed_out:
+        problems.append(f"the child was killed after {plan.child_timeout_s:.0f}s")
+    ok = not problems
+    if not ok and plan.failed_dir:  # keep the evidence of a failed attempt
+        keep = os.path.join(plan.failed_dir, f"{label}-{name}")
+        shutil.rmtree(keep, ignore_errors=True)
+        os.makedirs(plan.failed_dir, exist_ok=True)
+        if os.path.isdir(run_dir):
+            shutil.copytree(run_dir, keep, symlinks=True)
+        else:
+            os.makedirs(keep)
+        if os.path.exists(log):
+            shutil.copy(log, os.path.join(keep, "child.log"))
+    shutil.rmtree(run_dir, ignore_errors=True)
+    full = {**inner, **evidence}
     return {
         "set": label,
         "task": task,
@@ -238,20 +432,23 @@ def record(plan: Plan, task: str, rep: int, scratch: str) -> dict[str, Any]:
         **outer,
         "cpu_s": outer["user_s"] + outer["sys_s"],
         "exit": code,
+        "timed_out": timed_out,
         "ok": ok,
+        "problems": problems,
         "commands_executed": inner.get("commands_executed"),
         "model_turns": inner.get("model_turns"),
         "engine_total_wall_s": inner.get("total_wall_s"),
         "agent_wall_s": inner.get("agent_wall_s"),
         "verification_wall_s": inner.get("verification_wall_s"),
         "monitor_overhead_s": inner.get("monitor_overhead_s"),
-        "digest": canonical_digest(inner) if row else None,
+        "work_sha256": evidence.get("work_sha256"),
+        "digest": canonical_digest(full),
     }
 
 
 def run_batches(plan: Plan) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """tasks x reps, `workers` at a time. A budget stop is recorded, never hidden:
-    the CPU spent so far is checked before each run starts."""
+    """tasks x reps, `workers` at a time, under an admission-control budget (see
+    the module docstring): a stop is recorded, a wave in flight is not killed."""
     workers = max(1, min(plan.workers, MAX_WORKERS))
     plan = dataclasses.replace(plan, workers=workers)
     jobs = [(task, rep) for rep in range(plan.reps) for task in plan.tasks]
@@ -262,18 +459,19 @@ def run_batches(plan: Plan) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     )
     t0 = time.perf_counter()
     try:
-        # chunk by `workers` so the budget is re-checked between waves
         for i in range(0, len(jobs), workers):
-            if plan.spent_s + sum(r["cpu_s"] for r in rows) >= plan.budget_s:
-                stopped = f"cpu budget {plan.budget_s:.0f}s reached"
-                break
             wave = jobs[i : i + workers]
+            spent = plan.spent_s + sum(r["cpu_s"] for r in rows)
+            worst = max((r["cpu_s"] for r in rows), default=0.0)
+            if spent + worst * len(wave) >= plan.budget_s:
+                stopped = (
+                    f"cpu budget {plan.budget_s:.0f}s: {spent:.0f}s spent, next wave "
+                    f"of {len(wave)} would reach it"
+                )
+                break
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 rows += list(
-                    pool.map(
-                        lambda j: record(plan, j[0], j[1], scratch),
-                        wave,
-                    )
+                    pool.map(lambda j: record(plan, j[0], j[1], scratch), wave)
                 )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -328,12 +526,49 @@ def summary(rows: Iterable[dict[str, Any]], batches: list[dict[str, Any]]):
 
 
 def digests(rows: Iterable[dict[str, Any]]) -> dict[str, str]:
-    """task -> its single canonical digest (the correctness reference)."""
-    seen: dict[str, set[str]] = {}
+    """task -> its single canonical digest (the correctness reference), taken
+    over *all* repetitions and worker counts; a task with two digests (or any
+    run without one) has no reference."""
+    seen: dict[str, set[str | None]] = {}
     for r in rows:
-        if r["digest"]:
-            seen.setdefault(r["task"], set()).add(r["digest"])
-    return {t: sorted(d)[0] for t, d in seen.items() if len(d) == 1}
+        seen.setdefault(r["task"], set()).add(r["digest"])
+    single: dict[str, str] = {}
+    for task, found in seen.items():
+        only = next(iter(found))
+        if len(found) == 1 and only is not None:
+            single[task] = only
+    return single
+
+
+def validity_problems(
+    rows: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+    *,
+    budget_s: float,
+    reference_problem_list: list[str],
+) -> list[str]:
+    """Why this invocation's result must not be trusted (empty: valid)."""
+    problems = list(reference_problem_list)
+    for b in batches:
+        if b["stopped"] or b["attempted"] != b["planned"]:
+            problems.append(
+                f"workers={b['workers']}: incomplete matrix "
+                f"({b['attempted']}/{b['planned']}): {b['stopped']}"
+            )
+    for r in rows:
+        if not r["ok"]:
+            problems.append(
+                f"{r['set']}/workers={r['workers']} {r['task']} rep{r['rep']}: "
+                + "; ".join(r["problems"])
+            )
+    tasks = {r["task"] for r in rows}
+    good = digests(rows)
+    for task in sorted(tasks - set(good)):
+        problems.append(f"{task}: no single deterministic digest across all runs")
+    spent = sum(r["cpu_s"] for r in rows)
+    if spent > budget_s:
+        problems.append(f"cpu budget exceeded: {spent:.0f}s of {budget_s:.0f}s")
+    return problems
 
 
 def environment() -> dict[str, Any]:
@@ -354,7 +589,8 @@ def environment() -> dict[str, Any]:
 
 
 def render(doc: dict[str, Any]) -> str:
-    lines = []
+    lines = [f"VALID: {doc['valid']}"] if "valid" in doc else []
+    lines += [f"PROBLEM: {p}" for p in doc.get("problems", [])]
     for name, g in doc["groups"].items():
         lines.append(f"{name}: {g['runs']} runs, {g['execution_failures']} failures")
         for key in (
@@ -384,6 +620,27 @@ def render(doc: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def budget_arg(text: str) -> float:
+    value = float(text)
+    if not (math.isfinite(value) and 0 < value <= CPU_BUDGET_S):
+        raise argparse.ArgumentTypeError(
+            f"the CPU budget must be in (0, {CPU_BUDGET_S:.0f}] seconds"
+        )
+    return value
+
+
+def build_references(tasks: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    scratch = tempfile.mkdtemp(
+        prefix="cpu-ref-", dir="/var/tmp" if os.path.isdir("/var/tmp") else None
+    )
+    try:
+        refs = {t: reference(t, scratch) for t in tasks}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    problems = [p for t, r in refs.items() for p in reference_problems(t, r)]
+    return refs, problems
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     doc = workload()
     tasks = doc[args.set]
@@ -395,9 +652,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"{out} already holds a result; choose a new --out", file=sys.stderr)
         return 2
     os.makedirs(out, exist_ok=True)
+    refs, ref_problems = build_references(tasks)
     rows: list[dict[str, Any]] = []
     batches: list[dict[str, Any]] = []
-    for workers in args.workers:
+    for workers in args.workers if not ref_problems else []:
         spent = sum(r["cpu_s"] for r in rows)
         got, batch = run_batches(
             Plan(
@@ -408,6 +666,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 not args.no_strict_isolation,
                 args.cpu_budget,
                 spent,
+                os.path.join(out, "failed"),
+                refs,
             )
         )
         rows += got
@@ -416,13 +676,22 @@ def cmd_run(args: argparse.Namespace) -> int:
             break
     with open(os.path.join(out, "measurements.jsonl"), "w", encoding="utf-8") as f:
         f.writelines(json.dumps(r, sort_keys=True) + "\n" for r in rows)
+    problems = validity_problems(
+        rows, batches, budget_s=args.cpu_budget, reference_problem_list=ref_problems
+    )
     result: dict[str, Any] = {
         "environment": environment(),
         "workload_sha256": hashlib.sha256(
             pathlib.Path(WORKLOAD).read_bytes()
         ).hexdigest(),
         "set": args.set,
+        "valid": not problems,
+        "problems": problems,
+        "cpu_budget_s": args.cpu_budget,
+        "cpu_budget_mode": "admission-control (checked before each wave; "
+        "a wave in flight is not killed, so overshoot is possible and reported)",
         "cpu_spent_s": sum(r["cpu_s"] for r in rows),
+        "references": refs,
         "reference_digests": digests(rows),
         **summary(rows, batches),
     }
@@ -430,14 +699,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         json.dump(result, f, indent=2, sort_keys=True)
     print(render(result))
     print(f"cpu spent {result['cpu_spent_s']:.1f}s of {args.cpu_budget:.0f}s")
-    failed = any(g["execution_failures"] for g in result["groups"].values())
-    return 1 if failed else 0
+    return 0 if result["valid"] else 1
 
 
 def cmd_report(args: argparse.Namespace) -> int:
     with open(os.path.join(args.dir, "summary.json"), encoding="utf-8") as f:
-        print(render(json.load(f)))
-    return 0
+        doc = json.load(f)
+    print(render(doc))
+    return 0 if doc.get("valid") else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -452,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--reps", type=int, default=3)
     r.add_argument("--workers", type=int, nargs="+", default=[1])
     r.add_argument("--out", default=os.path.join(ROOT, "runs", "cpu-profile", "run"))
-    r.add_argument("--cpu-budget", type=float, default=CPU_BUDGET_S)
+    r.add_argument("--cpu-budget", type=budget_arg, default=CPU_BUDGET_S)
     r.add_argument("--no-strict-isolation", action="store_true")
     r.set_defaults(fn=cmd_run)
     s = sub.add_parser("report")
