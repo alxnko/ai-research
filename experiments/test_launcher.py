@@ -28,7 +28,8 @@ from typing import Any
 from unittest import mock
 
 from bench import bench as engine
-from experiments import controller, launcher, source_identity
+from experiments import controller, launcher, server_identity, source_identity
+from experiments.test_server_identity import FakeOllama, ps_entry, tags_entry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TAG = "v0.5"
@@ -732,9 +733,9 @@ class TestEndToEnd(Release):
         self.assertEqual(controller.run(m, self.runs, manifest_path=self.path), 2)
 
 
-class TestIncompleteAndObserved(Release):
-    def run_with_fake_engine(self, fake_main, arm: str = "control"):
-        m = self.write(self.manifest())
+class FakeEngineRelease(Release):
+    def run_with_fake_engine(self, fake_main, arm: str = "control", manifest=None):
+        m = self.write(manifest or self.manifest())
         stage = os.path.join(self.tmp, f"stage-{arm}")
         os.makedirs(stage)
         argv = ["--manifest", self.path, "--arm", arm, "--run-dir", stage]
@@ -751,6 +752,8 @@ class TestIncompleteAndObserved(Release):
         ]
         return engine._mock_chat_stream("m", msgs, 1, 0)
 
+
+class TestIncompleteAndObserved(FakeEngineRelease):
     def test_engine_crash_keeps_the_attempt_and_writes_no_provenance(self):
         def crash():
             raise RuntimeError("boom")
@@ -854,6 +857,160 @@ class TestIncompleteAndObserved(Release):
         self.run_with_fake_engine(capture, arm="verification")
         self.assertIn(NEW_SENTENCE, seen["prompt"])
         self.assertNotIn(OLD_SENTENCE, seen["prompt"])
+
+
+class TestServerIdentity(FakeEngineRelease):
+    """The real-backend path against a fake Ollama: the engine's mock model
+    stands in for inference, the identity checks are the production ones."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake = FakeOllama()
+        self.addCleanup(self.fake.close)
+        self.bare = self.digests["manifest_digest"].removeprefix("sha256:")
+        self.serve()
+        self.real_instance_problems = server_identity.instance_problems
+        patches = (
+            mock.patch.object(server_identity, "BASE", self.fake.base),
+            # the engine targets :11434; the fake listens elsewhere
+            mock.patch.object(
+                server_identity, "instance_problems", lambda engine, base=None: []
+            ),
+            mock.patch.object(launcher, "backend", lambda: "ollama"),
+        )
+        for patch in patches:
+            self.enterContext(patch)
+
+    def manifest(self) -> dict[str, Any]:
+        m = super().manifest()
+        m["inference"] = "ollama"
+        return m
+
+    def serve(self, digest: str | None = None, ctx: int | None = None) -> None:
+        digest = digest or self.bare
+        ctx = ctx or self.manifest()["settings"]["ctx"]
+        self.fake.tags = {"models": [tags_entry(self.MODEL, digest)]}
+        self.fake.ps = {"models": [ps_entry(self.MODEL, digest, ctx)]}
+
+    def honest(self, calls: int = 1, between=None):
+        def main() -> int:
+            for n in range(calls):
+                self.request(engine.SYSTEM_PROMPT_TOOLS.format(max_steps=20))
+                if between:
+                    between(n)
+            return 0
+
+        return main
+
+    def test_a_clean_attempt_records_the_servers_evidence(self):
+        m, stage, code = self.run_with_fake_engine(self.honest(calls=2))
+        self.assertEqual(code, 0)
+        prov = json.loads(pathlib.Path(stage, "provenance.json").read_text())
+        srv = prov["server_identity"]
+        digest = self.digests["manifest_digest"]
+        self.assertEqual(srv["advertised_digest"], digest)
+        self.assertEqual(srv["loaded_digest"], digest)
+        self.assertEqual(srv["loaded_context"], m["settings"]["ctx"])
+        self.assertEqual(srv["loaded_checks"], prov["model_calls"])
+        self.assertEqual(srv["instance"], self.fake.base)
+        self.assertEqual(controller._server_problems(m, prov), [])
+        # tags before, then ps after each call, then both again
+        self.assertEqual(
+            self.fake.hits,
+            ["/api/tags", "/api/ps", "/api/ps", "/api/tags", "/api/ps"],
+        )
+
+    def refused(self, problem: str) -> None:
+        _m, stage, code = self.run_with_fake_engine(self.honest())
+        self.assertEqual(code, launcher.REFUSED)
+        self.assertEqual(os.listdir(stage), ["launch-refused.json"])  # no engine
+        self.assertIn(problem, pathlib.Path(stage, "launch-refused.json").read_text())
+        self.assertNotIn("/api/ps", self.fake.hits)  # nothing was loaded or called
+
+    def test_a_server_that_does_not_list_the_model_is_refused_before_inference(self):
+        self.fake.tags = {"models": []}
+        self.refused("is not listed")
+
+    def test_a_server_with_other_weights_under_the_name_is_refused(self):
+        self.serve(digest="7" * 64)
+        self.refused("registered sha256:")
+
+    def test_an_unavailable_server_is_refused_not_ignored(self):
+        self.fake.tags = 500
+        self.refused("/api/tags unavailable")
+
+    def test_a_local_store_that_matches_cannot_vouch_for_the_server(self):
+        # the local fingerprint check passes (fake store == manifest); the server
+        # says otherwise, and the server wins
+        self.fake.tags = {"models": [tags_entry(self.MODEL, "9" * 64)]}
+        self.refused("registered sha256:")
+
+    def test_the_model_is_swapped_during_the_run(self):
+        def swap(n: int) -> None:
+            if n == 0:
+                self.serve(digest="8" * 64)
+
+        self.assertFailedAttempt(self.honest(calls=2, between=swap), "after model call")
+
+    def test_the_tag_is_repulled_after_the_last_call(self):
+        def repull(n: int) -> None:
+            self.fake.tags = {"models": [tags_entry(self.MODEL, "6" * 64)]}
+
+        self.assertFailedAttempt(self.honest(between=repull), "at completion")
+
+    def test_the_model_is_not_loaded_after_a_call(self):
+        def unload(n: int) -> None:
+            self.fake.ps = {"models": []}
+
+        self.assertFailedAttempt(self.honest(between=unload), "is not listed")
+
+    def test_the_context_differs_from_the_experiments(self):
+        self.serve(ctx=4096)
+        self.assertFailedAttempt(self.honest(), "experiment requests")
+
+    def test_a_run_that_never_loaded_the_model_is_not_promoted(self):
+        self.assertFailedAttempt(lambda: 0, "no model call")
+
+    def assertFailedAttempt(self, fake_main, reason: str) -> None:
+        m, stage, code = self.run_with_fake_engine(fake_main)
+        self.assertEqual(code, launcher.FAILED)
+        self.assertNotIn("provenance.json", os.listdir(stage))
+        self.assertIn(reason, pathlib.Path(stage, "launch-failed.json").read_text())
+        self.assertTrue(  # the controller would quarantine what is left
+            controller.validate_attempt(m, "control", 42, TASK, stage)
+        )
+
+    def test_the_controller_preflight_asks_the_server_too(self):
+        m = self.write(self.manifest())
+        found = controller._preflight_run(m, self.runs, True, self.path)
+        self.assertEqual([p for p in found if "api/tags" in p], [])
+        self.fake.tags = {"models": []}
+        found = controller._preflight_run(m, self.runs, True, self.path)
+        self.assertTrue(any("is not listed" in p for p in found), found)
+
+    def test_the_inspected_server_must_be_the_one_the_engine_calls(self):
+        # undo the test patch: the fake listens elsewhere than the engine's target
+        with mock.patch.object(
+            server_identity, "instance_problems", self.real_instance_problems
+        ):
+            self.refused("the engine calls http://127.0.0.1:11434")
+
+    def test_verify_live_asks_the_server(self):
+        self.write(self.manifest())
+        argv = ["verify", self.path, "--live"]
+        self.assertEqual(controller.main(argv), 0)
+        self.fake.tags = {"models": []}
+        self.assertEqual(controller.main(argv), 2)
+
+    def test_a_mock_experiment_never_asks_the_server(self):
+        mocked = self.manifest()
+        mocked["inference"] = "mock"
+        with mock.patch.object(launcher, "backend", lambda: "mock"):
+            _m, stage, code = self.run_with_fake_engine(self.honest(), manifest=mocked)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.fake.hits, [])
+        prov = json.loads(pathlib.Path(stage, "provenance.json").read_text())
+        self.assertIsNone(prov["server_identity"])
 
 
 class TestRecorder(Quiet):

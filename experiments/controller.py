@@ -38,7 +38,7 @@ from fractions import Fraction
 from typing import Any
 
 from bench import bench as engine
-from experiments import source_identity
+from experiments import server_identity, source_identity
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUITES = os.path.join(ROOT, "bench", "suites")
@@ -579,7 +579,30 @@ def _check_records(
             prov.get("inference_backend") == manifest.get("inference", "ollama"),
             "the inference backend differs from the manifest's (mock vs real)",
         )
+        if manifest.get("inference", "ollama") == "ollama":
+            problems += _server_problems(manifest, prov)
     return problems
+
+
+def _server_problems(manifest: dict[str, Any], prov: dict[str, Any]) -> list[str]:
+    """A real-backend record must carry the server's own identity evidence."""
+    srv = prov.get("server_identity")
+    if not isinstance(srv, dict):
+        return ["no server-side model identity was recorded"]
+    digest = server_identity.normalise_digest(manifest["model"]["manifest_digest"])
+    calls = prov.get("model_calls")
+    checks = (
+        (srv.get("instance") == server_identity.BASE, "instance"),
+        (srv.get("attestation") == server_identity.ATTESTATION, "attestation"),
+        (srv.get("advertised_digest") == digest, "advertised digest"),
+        (srv.get("loaded_digest") == digest, "loaded digest"),
+        (srv.get("loaded_context") == manifest["settings"]["ctx"], "loaded context"),
+        (
+            isinstance(calls, int) and srv.get("loaded_checks") == calls,
+            "one loaded-model check per model call",
+        ),
+    )
+    return [f"server identity: {name} differs" for ok, name in checks if not ok]
 
 
 def _transcript_problems(manifest: dict[str, Any], arm: str, cell: str) -> list[str]:
@@ -880,6 +903,10 @@ def _preflight_run(
     problems = preflight(manifest, live=live)
     if live:  # run-only: the code about to execute must be the registered code
         problems += source_identity.verify_source(manifest)
+        if manifest.get("inference", "ollama") == "ollama":
+            problems += server_identity.advertised(
+                manifest["model"]["tag"], manifest["model"]["manifest_digest"]
+            )[0]
     if not (manifest_path or launch_for):
         problems.append("no manifest path for the generic launcher")
     state = scan(manifest, runs)
@@ -1032,6 +1059,10 @@ def main(argv: list[str] | None = None) -> int:
         problems = source_identity.verify_source(manifest)
         if args.live:
             problems += preflight(manifest, live=True)
+            if manifest.get("inference", "ollama") == "ollama":
+                problems += server_identity.advertised(
+                    manifest["model"]["tag"], manifest["model"]["manifest_digest"]
+                )[0]
         print("\n".join(problems) or "benchmark code matches the registered release")
         return 2 if problems else 0
     if args.command == "plan":

@@ -20,11 +20,14 @@ Order of events (a failure before step 5 exits 4 and leaves only
     before the engine is imported, then again after (see 3).
  3. The engine and controller are imported; every loaded `bench.*` module must
     be one of the registered source files, and the verification is repeated.
- 4. The manifest is the one the controller approved (hash), the bench arguments
-    are exactly those it derives, the inference backend matches the manifest
-    (the engine's mock model is refused for a real experiment), the model's
-    manifest/config/weights digests match, and the arm's prompt (the engine's
-    own base prompt plus the manifest's `prompt_edit`) hashes to its pins.
+ 4. For a real (ollama) backend the server is asked, before inference, to
+    confirm that it serves the registered manifest digest for the tag (see
+    `server_identity`). The manifest is the one the controller approved
+    (hash), the bench arguments are exactly those it derives, the inference
+    backend matches the manifest (the engine's mock model is refused for a
+    real experiment), the model's manifest/config/weights digests match, and
+    the arm's prompt (the engine's own base prompt plus the manifest's
+    `prompt_edit`) hashes to its pins.
  5. The unchanged engine runs behind a recorder that hashes the system message
     of every request reaching the model-call function (the step loop and the
     empty-reply retry both go through it). Only if every request carried exactly
@@ -40,8 +43,10 @@ the expanded text actually transmitted, observed at the model call. They are
 different quantities and are not comparable with each other.
 
 Known limit: the observation point is the model-call function's arguments. The
-HTTP body is built from that same message list; the server's own model store
-(as opposed to the local one the fingerprint is read from) is not inspected.
+HTTP body is built from that same message list. Server-side model identity
+(`experiments/server_identity.py`: /api/tags before, /api/ps after every call,
+both again at completion; same instance as the engine's client) is consistency
+evidence from the server's own advertised digest, not attestation of weights.
 """
 
 from __future__ import annotations
@@ -59,7 +64,7 @@ import time
 from collections.abc import Generator, Mapping
 from typing import Any
 
-from experiments import source_identity  # stdlib only; no bench import
+from experiments import server_identity, source_identity  # stdlib only
 
 REFUSED, FAILED = 4, 5
 
@@ -139,9 +144,10 @@ def prompt_hashes(manifest: dict[str, Any], arm: str) -> dict[str, str]:
 class Recorder:
     """Hashes the system message of every request that reaches the model call."""
 
-    def __init__(self) -> None:
+    def __init__(self, observer=None) -> None:
         self.calls = 0
         self.system_hashes: set[str] = set()
+        self.observer = observer  # called after every request, even a failed one
 
     def wrap(self, fn):
         def recorded(*args, **kwargs):
@@ -152,7 +158,11 @@ class Recorder:
                 self.system_hashes.add(_sha(first["content"]))
             else:  # a request without its system message can never match a pin
                 self.system_hashes.add(f"not-a-system-message:{first.get('role')}")
-            return fn(*args, **kwargs)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if self.observer:
+                    self.observer()
 
         return recorded
 
@@ -242,6 +252,17 @@ def pre_inference_problems(
         if fingerprint.get(k) != manifest["model"][k]:
             problems.append(f"model {k} differs from the manifest")
 
+    facts["server_identity"] = None
+    if facts["inference_backend"] == "ollama":
+        watcher = server_identity.Watcher(
+            manifest["model"]["tag"],
+            manifest["model"]["manifest_digest"],
+            manifest["settings"]["ctx"],
+        )
+        problems += server_identity.instance_problems(engine)
+        problems += watcher.begin()
+        facts["watcher"] = watcher
+
     try:
         facts.update(prompt_hashes(manifest, arm))
     except ValueError as exc:
@@ -325,6 +346,7 @@ def _execute(
     facts: dict[str, Any],
 ) -> int:
     controller, engine = _controller(), _engine()
+    watcher = facts.pop("watcher", None)
     attempt = controller.attempt_id(manifest, arm, facts["seed"], facts["task"])
     _write(
         run_dir,
@@ -333,7 +355,7 @@ def _execute(
     )
 
     prompt_attr, template = arm_prompt(manifest, arm)
-    recorder = Recorder()
+    recorder = Recorder(watcher.observe if watcher else None)
     setattr(engine, prompt_attr, template)
     engine.chat_stream = recorder.wrap(engine.chat_stream)
     engine._mock_chat_stream = recorder.wrap(engine._mock_chat_stream)
@@ -351,6 +373,8 @@ def _execute(
         sys.argv = saved_argv
 
     failures = observed_problems(recorder, facts["system_prompt_sha256"])
+    if watcher:
+        failures += watcher.finish()
     if failures:
         _write(run_dir, "launch-failed.json", {"problems": failures})
         print("launch failed:\n  " + "\n  ".join(failures), file=sys.stderr)
@@ -370,6 +394,7 @@ def _execute(
             "source_verification": "git+filesystem",
             "inference_backend": facts["inference_backend"],
             "model_fingerprint": facts["model_fingerprint"],
+            "server_identity": watcher.record() if watcher else None,
             "prompt_sha256": facts["prompt_sha256"],
             "system_prompt_sha256": next(iter(recorder.system_hashes)),
             "model_calls": recorder.calls,
