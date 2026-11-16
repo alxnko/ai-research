@@ -1,36 +1,42 @@
 # CPU-PROFILE calibration baseline (measurement only)
 
 Run: `python -m experiments.cpu_profile run --set calibration --reps 5 --workers 1 2 4`
-at code `983e59d` (benchmark `v0.5` unchanged; scripted actor, no inference).
-Calibration set only (14 tasks, 5 reps, 3 worker settings = 210 runs); the final
-set was not run. Raw records stay in the gitignored `runs/cpu-profile/`.
+at code `91bba8e`, clean tree (benchmark `v0.5` unchanged; scripted actor, no
+inference). Calibration set only (14 tasks, 5 reps, 3 worker settings = 210
+runs); the final set was not run. Raw records stay in the gitignored
+`runs/cpu-profile/`.
 
-This **supersedes the first baseline** (taken at `5f6b6fd` before the validity
-and independent-reference corrections; its numbers were within noise of these).
+This **supersedes the earlier baselines** (taken before the validity,
+independent-reference and reference-isolation corrections). An intermediate run
+of the same command on an uncommitted tree was discarded, not reported.
 
 **Validity: `valid: true`.** Full matrix 210/210 completed; every child exited
 0; every run matched the independent reference (workspace, installed hidden
-tests, verification output) and the pinned fixture digest; each of the 14 tasks
-has a single digest across all repetitions and all three worker counts (the
-14 reference digests are in the run's `summary.json`). CPU spent 66 s of the
-1,200 s budget (admission control; no overshoot). Machine shared, load average
-≈ 6–8 at the start on 12 CPUs: absolute numbers are indicative.
+tests, verification output; the reference's tests ran in their own bubblewrap
+after the fixture digest matched the suite pin) and each of the 14 tasks has a
+single digest across all repetitions and all three worker counts (digests are in
+the run's `summary.json`). The workload split hashed to the registered
+`8c07eaa9…dda4`. CPU spent 83 s of the 1,200 s budget (admission control; no
+overshoot). **The machine was heavily shared: load average ≈ 33 at the start on
+12 CPUs** (earlier baselines saw 6-8), so wall times are inflated and noisy;
+CPU time is the steadier figure. Absolute numbers are indicative only.
 
 | 1 worker, median / p95 | seconds |
 |---|---|
-| wall per attempt | 1.02 / 1.39 |
-| CPU (user+sys, process tree) | 0.31 / 0.36 |
-| agent phase (one command, sandbox included) | 0.57 / 0.59 |
-| verification (hidden tests) | 0.09 / 0.49 |
-| GPU-monitor overhead | 0.07 / 0.09 |
-| outside the engine (start-up, imports, teardown) | 0.33 / 0.48 |
+| wall per attempt | 1.56 / 2.41 |
+| CPU (user+sys, process tree) | 0.39 / 0.49 |
+| agent phase (one command, sandbox included) | 0.61 / 0.76 |
+| verification (hidden tests) | 0.20 / 0.69 |
+| GPU-monitor overhead | 0.10 / 0.26 |
+| outside the engine (start-up, imports, teardown) | 0.68 / 1.24 |
 
 Peak RSS of the largest process ≈ 31 MiB.
 
-Scaling (70 runs per setting): 3,361 → 6,238 → 10,870 verified workflows/hour
-at 1 / 2 / 4 workers (3.2× at 4); per-run wall median 1.02 → 1.01 → 1.13 s,
-monitor overhead 0.07 → 0.08 → 0.09 s. One worker-2 run took 3.0 s wall (agent
-phase 2.2 s): a single outlier on a shared machine, retained.
+Scaling (70 runs per setting): 2,164 → 4,147 → 5,934 verified workflows/hour at
+1 / 2 / 4 workers (2.7× at 4). Under this load these are lower than the
+earlier, quieter-machine figures (3.4k → 6.2k → 10.9k); a comparison of an
+optimisation against this baseline must therefore be interleaved in time, never
+against a stored number.
 
 ## What this suggests (hypotheses, not findings)
 These need a read-only timing breakdown before anything is changed:
