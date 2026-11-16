@@ -44,9 +44,18 @@ A repetition counts only if all of these hold:
    reference solution applied; the hidden tests installed in the scoring copy
    equal the task's pinned tests; and the engine's verification output equals
    (timings removed) the output of one independent run of the task's test
-   command on that reference. The task fixture digest must equal the suite pin;
+   command on that reference. The task fixture digest is compared with the suite
+   pin **before** any of its code runs, and that independent test run happens in
+   its own bubblewrap (no network, empty environment, host files read-only, only
+   the scratch copy writable), never on the host; without `bwrap` the reference
+   fails closed;
 4. every deterministic field is present (a missing or null field is a failure,
    never hashed as `None`).
+
+The run specification is enforced: `--reps` and `--workers` must be positive
+(workers at most 4), the workload split must hash to the sha256 registered
+above (otherwise exit 2 before anything runs), and an invocation with no
+attempts, or a matrix that is not tasks x reps as requested, is invalid.
 
 Each passing repetition yields a canonical digest over those fields plus the
 engine's outcome, file lists, commands, turns, tool calls and tokens. The

@@ -7,7 +7,9 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -209,6 +211,53 @@ class TestReference(Quiet):
         self.assertTrue(cp.reference_problems(TASK, {**ref, "tests_exit": None}))
 
 
+class TestReferenceIsolation(Quiet):
+    def run_isolated(self, code: str) -> subprocess.CompletedProcess[str]:
+        work = os.path.join(self.tmp, "w")
+        os.makedirs(work, exist_ok=True)
+        cmd = cp.isolated_cmd(work, f"python3 -c {shlex.quote(code)}")
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    def test_the_reference_cannot_reach_a_host_listener(self):
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            code = f"import socket;socket.create_connection(('127.0.0.1', {port}), 1)"
+            got = self.run_isolated(code)
+        self.assertNotEqual(got.returncode, 0, "the sandbox reached the host network")
+
+    def test_the_host_environment_and_filesystem_are_not_exposed(self):
+        os.environ["CPU_PROFILE_SECRET"] = "leak"
+        self.addCleanup(os.environ.pop, "CPU_PROFILE_SECRET", None)
+        got = self.run_isolated("import os;print(os.environ.get('CPU_PROFILE_SECRET'))")
+        self.assertEqual(got.stdout.strip(), "None")
+        got = self.run_isolated("open('/usr/x', 'w')")
+        self.assertNotEqual(got.returncode, 0)
+
+    def test_a_drifted_fixture_is_refused_before_any_of_its_code_runs(self):
+        with (
+            mock.patch.object(engine, "task_digest", lambda t: "0" * 64),
+            mock.patch.object(cp.subprocess, "run") as run,
+        ):
+            ref = cp.reference(TASK, self.tmp)
+        run.assert_not_called()
+        problems = cp.reference_problems(TASK, ref)
+        self.assertTrue(any("pins" in p for p in problems), problems)
+
+    def test_without_bubblewrap_the_reference_fails_closed(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[0])
+            raise FileNotFoundError(cmd[0])
+
+        with mock.patch.object(cp.subprocess, "run", run):
+            ref = cp.reference(TASK, self.tmp)
+        self.assertEqual(calls, ["bwrap"])  # never `sh` on the host
+        self.assertTrue(cp.reference_problems(TASK, ref))
+
+
 class TestIntegrity(unittest.TestCase):
     REF: ClassVar[dict[str, Any]] = {
         "work_sha256": "w",
@@ -274,7 +323,7 @@ class TestScriptedActor(Quiet):
     def test_the_command_reproduces_the_reference_solution(self):
         tdir = os.path.join(engine.TASKS, TASK)
         work = os.path.join(self.tmp, "work")
-        os.makedirs(work)
+        os.makedirs(work, exist_ok=True)
         done = subprocess.run(
             ["sh", "-c", cp.solution_command(tdir)], cwd=work, capture_output=True
         )
@@ -290,7 +339,7 @@ class TestScriptedActor(Quiet):
         with open(os.path.join(tdir, "solution", "pkg", "sub", "m.py"), "w") as f:
             f.write("x = 'q'\n")
         work = os.path.join(self.tmp, "w")
-        os.makedirs(work)
+        os.makedirs(work, exist_ok=True)
         subprocess.run(["sh", "-c", cp.solution_command(tdir)], cwd=work, check=True)
         with open(os.path.join(work, "pkg", "sub", "m.py")) as f:
             self.assertEqual(f.read(), "x = 'q'\n")
@@ -456,9 +505,13 @@ class TestValidity(unittest.TestCase):
         return [rec(plan(), t, 0, "") for t in ("a", "b")]
 
     @staticmethod
-    def check(rows, batches, budget=100.0, refs=()):
+    def check(rows, batches, budget=100.0, refs=(), planned=2):
         return cp.validity_problems(
-            rows, batches, budget_s=budget, reference_problem_list=list(refs)
+            rows,
+            batches,
+            budget_s=budget,
+            reference_problem_list=list(refs),
+            planned_per_batch=planned,
         )
 
     def test_a_complete_consistent_matrix_is_valid(self):
@@ -495,6 +548,15 @@ class TestValidity(unittest.TestCase):
         found = self.check(self.rows(cpu=30.0), [self.batch()], budget=50.0)
         self.assertTrue(any("budget exceeded" in p for p in found), found)
 
+    def test_an_empty_matrix_is_invalid(self):
+        found = self.check([], [self.batch(attempted=0, planned=0)], planned=0)
+        self.assertTrue(any("no attempts" in p for p in found), found)
+        self.assertTrue(self.check([], []))
+
+    def test_a_batch_that_is_not_the_requested_size_is_invalid(self):
+        found = self.check(self.rows(), [self.batch()], planned=4)
+        self.assertTrue(any("requested 4" in p for p in found), found)
+
     def test_reference_problems_are_carried(self):
         found = self.check(self.rows(), [self.batch()], refs=["x did not pass"])
         self.assertIn("x did not pass", found)
@@ -518,6 +580,30 @@ class TestCli(Quiet):
     def summary(self) -> dict[str, Any]:
         with open(os.path.join(self.out(), "summary.json")) as f:
             return json.load(f)
+
+    def test_nonpositive_repetitions_and_worker_counts_are_rejected(self):
+        for bad in (["--reps", "0"], ["--reps", "-1"], ["--workers", "0"],
+                    ["--workers", "1", "-2"], ["--workers", "5"]):  # fmt: skip
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as ctx:
+                self.run_cli("--set", "calibration", "--out", self.out(), *bad)
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse(os.path.exists(self.out()))
+
+    def test_a_modified_workload_file_is_refused(self):
+        altered = os.path.join(self.tmp, "w.json")
+        with open(cp.WORKLOAD, encoding="utf-8") as f, open(altered, "w") as g:
+            doc = json.load(f)
+            doc["calibration"] = doc["calibration"][:-1]
+            json.dump(doc, g)
+        with mock.patch.object(cp, "WORKLOAD", altered):
+            self.assertRaises(ValueError, cp.workload)
+            code = cp.main(["run", "--set", "calibration", "--out", self.out()])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.out(), "summary.json")))
+
+    def test_the_pinned_split_hash_is_the_one_the_protocol_registers(self):
+        protocol = pathlib.Path(cp.ROOT, "experiments", "CPU-PROFILE_PROTOCOL.md")
+        self.assertIn(cp.WORKLOAD_SHA256, protocol.read_text(encoding="utf-8"))
 
     def test_the_final_set_needs_an_explicit_flag(self):
         self.assertEqual(self.run_cli("--set", "final", "--out", self.out()), 2)

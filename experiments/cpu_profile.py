@@ -67,6 +67,9 @@ from bench import bench as engine
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKLOAD = os.path.join(ROOT, "experiments", "cpu_workload.json")
+# The registered calibration/final split (CPU-PROFILE_PROTOCOL.md). Changing the
+# split means a new protocol version, so this is a pin, not a setting.
+WORKLOAD_SHA256 = "8c07eaa9e154a24398144e415c92af3f55adc55bfc6ee93615f53023d028dda4"
 MAX_WORKERS = 4
 CPU_BUDGET_S = 1200.0  # protocol: 20 minutes of CPU time
 CHILD_TIMEOUT_S = 300.0  # a hung child is killed, recorded and kept as evidence
@@ -152,8 +155,12 @@ def summarize(values: list[float]) -> dict[str, float]:
 
 
 def workload() -> dict[str, Any]:
-    with open(WORKLOAD, encoding="utf-8") as f:
-        return json.load(f)
+    """The registered split; refuses a file that is not the pinned one."""
+    raw = pathlib.Path(WORKLOAD).read_bytes()
+    found = hashlib.sha256(raw).hexdigest()
+    if found != WORKLOAD_SHA256:
+        raise ValueError(f"{WORKLOAD} is {found}, the protocol pins {WORKLOAD_SHA256}")
+    return json.loads(raw)
 
 
 def workload_problems(doc: dict[str, Any], suite: dict[str, Any]) -> list[str]:
@@ -180,40 +187,61 @@ def staged_solution(task_id: str, dest: str) -> str:
     return work
 
 
+def isolated_cmd(work: str, command: str) -> list[str]:
+    """The task's test command in its own bubblewrap: no network, no host home or
+    environment, only `work` writable. Deliberately not `engine.bwrap_cmd`, so the
+    reference does not share the code it is checking."""
+    setenv = {"PATH": "/usr/bin:/bin", "HOME": "/root", "LC_ALL": "C.UTF-8"}
+    cmd = ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
+    cmd += ["--bind", work, "/tmp/work", "--tmpfs", "/home", "--tmpfs", "/root"]
+    cmd += ["--proc", "/proc", "--dev", "/dev", "--chdir", "/tmp/work"]
+    cmd += ["--unshare-all", "--die-with-parent", "--clearenv"]
+    for key, value in setenv.items():
+        cmd += ["--setenv", key, value]
+    return [*cmd, "sh", "-c", command]
+
+
 def reference(task_id: str, scratch: str) -> dict[str, Any]:
     """What a correct attempt must leave behind, derived without the engine's
     scoring or sandbox: expected workspace, expected hidden tests as installed in
-    the scoring copy, and the output of one independent run of the task's tests."""
+    the scoring copy, and the output of one independent run of the task's tests.
+    The fixture is checked against the suite pin *before* any of its code runs."""
+    pinned = engine.load_suite("v0.5")["tasks"][task_id]
+    found = engine.task_digest(task_id)
+    ref: dict[str, Any] = {"task_digest": pinned, "fixture_digest": found}
+    if found != pinned:
+        ref["tests_exit"] = None
+        return ref
     meta = engine.load_task(task_id)
     dest = tempfile.mkdtemp(prefix=f"ref-{task_id}-", dir=scratch)
     work = staged_solution(task_id, dest)
-    ref: dict[str, Any] = {"work_sha256": tree_digest(work)}
+    ref["work_sha256"] = tree_digest(work)
     hidden = os.path.join(work, "_hidden")
     shutil.copytree(os.path.join(engine.TASKS, task_id, "tests"), hidden)
     pathlib.Path(hidden, "__init__.py").touch()  # as the scorer installs them
     ref["hidden_sha256"] = tree_digest(hidden)
     try:
         done = subprocess.run(
-            ["sh", "-c", meta["test_cmd"]],
-            cwd=work,
+            isolated_cmd(work, meta["test_cmd"]),
             capture_output=True,
             text=True,
-            timeout=meta.get("timeout_s", meta.get("test_timeout_s", 120)),
+            timeout=meta.get("timeout_s", 120),
             check=False,
         )
         ref["tests_exit"] = done.returncode
         ref["verification_evidence_sha256"] = evidence_digest(
             (done.stdout + done.stderr).strip()
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired, OSError:  # e.g. no bwrap: fail closed
         ref["tests_exit"] = None
         ref["verification_evidence_sha256"] = None
-    ref["task_digest"] = engine.load_suite("v0.5")["tasks"][task_id]
     shutil.rmtree(dest, ignore_errors=True)
     return ref
 
 
 def reference_problems(task_id: str, ref: dict[str, Any]) -> list[str]:
+    if ref["fixture_digest"] != ref["task_digest"]:
+        return [f"{task_id}: the fixture on disk is not the one the suite pins"]
     if ref["tests_exit"] != 0:
         return [f"{task_id}: the independent test run did not pass on the solution"]
     return []
@@ -546,10 +574,20 @@ def validity_problems(
     *,
     budget_s: float,
     reference_problem_list: list[str],
+    planned_per_batch: int,
 ) -> list[str]:
-    """Why this invocation's result must not be trusted (empty: valid)."""
+    """Why this invocation's result must not be trusted (empty: valid).
+    `planned_per_batch` is tasks x reps as the caller requested them, so an empty
+    or shrunken matrix cannot agree with itself."""
     problems = list(reference_problem_list)
+    if not rows:
+        problems.append("no attempts were made")
     for b in batches:
+        if b["planned"] != planned_per_batch:
+            problems.append(
+                f"workers={b['workers']}: planned {b['planned']} runs, "
+                f"requested {planned_per_batch}"
+            )
         if b["stopped"] or b["attempted"] != b["planned"]:
             problems.append(
                 f"workers={b['workers']}: incomplete matrix "
@@ -575,8 +613,14 @@ def environment() -> dict[str, Any]:
     head = subprocess.run(
         ["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True
     )
+    dirty = subprocess.run(
+        ["git", "-C", ROOT, "status", "--porcelain", "--", "bench", "experiments"],
+        capture_output=True,
+        text=True,
+    )
     return {
         "commit": head.stdout.strip(),
+        "tree_dirty": bool(dirty.stdout.strip()),
         "python": platform.python_version(),
         "cpus": os.cpu_count(),
         "loadavg_at_start": os.getloadavg(),
@@ -620,6 +664,20 @@ def render(doc: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def count_arg(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def workers_arg(text: str) -> int:
+    value = count_arg(text)
+    if value > MAX_WORKERS:
+        raise argparse.ArgumentTypeError(f"at most {MAX_WORKERS} concurrent workers")
+    return value
+
+
 def budget_arg(text: str) -> float:
     value = float(text)
     if not (math.isfinite(value) and 0 < value <= CPU_BUDGET_S):
@@ -642,7 +700,11 @@ def build_references(tasks: list[str]) -> tuple[dict[str, dict[str, Any]], list[
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    doc = workload()
+    try:
+        doc = workload()
+    except ValueError as err:
+        print(f"refusing to run: {err}", file=sys.stderr)
+        return 2
     tasks = doc[args.set]
     if args.set == "final" and not args.final:
         print("the final set needs --final (see the protocol)", file=sys.stderr)
@@ -677,7 +739,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     with open(os.path.join(out, "measurements.jsonl"), "w", encoding="utf-8") as f:
         f.writelines(json.dumps(r, sort_keys=True) + "\n" for r in rows)
     problems = validity_problems(
-        rows, batches, budget_s=args.cpu_budget, reference_problem_list=ref_problems
+        rows,
+        batches,
+        budget_s=args.cpu_budget,
+        reference_problem_list=ref_problems,
+        planned_per_batch=len(tasks) * args.reps,
     )
     result: dict[str, Any] = {
         "environment": environment(),
@@ -718,8 +784,8 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run")
     r.add_argument("--set", choices=("calibration", "final"), required=True)
     r.add_argument("--final", action="store_true")
-    r.add_argument("--reps", type=int, default=3)
-    r.add_argument("--workers", type=int, nargs="+", default=[1])
+    r.add_argument("--reps", type=count_arg, default=3)
+    r.add_argument("--workers", type=workers_arg, nargs="+", default=[1])
     r.add_argument("--out", default=os.path.join(ROOT, "runs", "cpu-profile", "run"))
     r.add_argument("--cpu-budget", type=budget_arg, default=CPU_BUDGET_S)
     r.add_argument("--no-strict-isolation", action="store_true")
