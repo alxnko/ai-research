@@ -35,15 +35,25 @@ median CPU pressure):
 
 ## Findings, classified by the registered rules
 
-**Confirmed dominant: `VramMonitor.stop()` blocks about 0.5 s.** It meets all
-three conditions: 36% of the critical path (>= 20%); the isolated measurement
-(start a monitor, stop it inside the sampler's sleep) reproduces it, 0.508 s vs
-0.515 s; it ranks first in both load halves. Mechanism, from reading
-`bench/telemetry.py` (not edited): the sampler loop ends each pass with
+**Study-level outcome: INCONCLUSIVE DUE TO LOAD.** The plan fixes this rule in
+advance: if the low- and high-load halves disagree on the ranking of the top
+components, the study is inconclusive and does not pick a winner. They disagree
+(top-3 order differs: the 2nd and 3rd places swap), so the registered outcome
+of this study is *inconclusive*. This report does not declare a winner.
+
+What can still be said, as an observation that the registered rules do not
+promote to a conclusion: `VramMonitor.stop()` ranks first in both halves (36%
+overall, 44% low load, 32% high load), the isolated measurement reproduces its
+cost (0.508 s vs 0.515 s), and the mechanism is visible in the source
+(`bench/telemetry.py`, not edited): the sampler loop ends each pass with
 `time.sleep(self.interval_s)` (0.5 s) instead of waiting on its stop event, and
 `stop()` sets the event and then joins the thread, so it waits for the sleep to
-end. This is a blocking join, not CPU: the monitor's own CPU per sample is
-about 2 ms.
+end. It is a blocking join, not CPU (about 2 ms CPU per sample). It meets the
+per-component criteria for "confirmed dominant" (>= 20%, reproduced within 2x,
+first in both halves) but, under the study-level rule, is a **strong candidate,
+not a confirmed result**. The next step is therefore a registered, interleaved
+control-vs-treatment comparison, which measures the effect directly and does not
+depend on this ranking; a lower-load rerun of the breakdown is not required.
 
 **Plausible but unproven**
 - *Sandbox launch.* 19% (just under the 20% line), but most of it is the
@@ -87,7 +97,6 @@ in this short workload. That time is overlapped, not added to the critical path
   nothing. An optimization that skips monitor work does not count: the sample
   count and peak-VRAM semantics must stay identical.
 - The registered rule "if the halves disagree on the ranking of the top
-  components, the study is inconclusive" was applied per component: the first
-  place (monitor `stop`) is the same in both halves, the 2nd/3rd places swap, so
-  only the latter are called inconclusive. The wording was ambiguous; this is
-  how it was applied.
+  components, the study is inconclusive" is applied at the study level, as
+  written (an earlier draft of this report applied it per component and
+  declared a confirmed winner; that was wrong).

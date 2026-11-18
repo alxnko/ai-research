@@ -262,11 +262,16 @@ def attempt(task: str, kind: str, refs: dict[str, Any], scratch: str, strict: bo
     out = {"task": task, "kind": kind, **outer, **host, "ok": not problems}
     out |= {"problems": problems, "cpu_s": outer["user_s"] + outer["sys_s"]}
     out["digest"] = cp.canonical_digest({**(row or {}), **evidence})
-    if kind == "traced" and os.path.exists(trace):
-        with open(trace, encoding="utf-8") as f:
-            tr = json.load(f)
-        out["breakdown"] = breakdown(tr, outer)
-        out["trace"] = tr
+    if kind == "traced":  # a traced attempt without a usable trace is a failure
+        try:
+            with open(trace, encoding="utf-8") as f:
+                tr = json.load(f)
+            out["breakdown"] = breakdown(tr, outer)
+            out["trace"] = tr
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            problems.append(f"trace missing or unusable: {type(exc).__name__}")
+            out["ok"] = False
+            out["problems"] = problems
     if problems:  # keep a failed attempt's evidence next to the raw records
         out["failed_log"] = log
     return out
@@ -590,10 +595,10 @@ def render(doc: dict[str, Any]) -> str:
                 f"  {c:14s} median {s['median']:.3f}  p95 {s['p95']:.3f}  "
                 f"iqr {s['iqr']:.3f}  share {s['share']:.0%}"
             )
-    lines.append(
-        "ranking of top 3 agrees across load halves: "
-        f"{doc.get('by_load_ranking_agrees')}"
-    )
+    agrees = doc.get("by_load_ranking_agrees")
+    lines.append(f"ranking of top 3 agrees across load halves: {agrees}")
+    if agrees is False:  # registered rule: the study does not pick a winner
+        lines.append("STUDY INCONCLUSIVE DUE TO LOAD (registered rule)")
     return "\n".join(lines)
 
 

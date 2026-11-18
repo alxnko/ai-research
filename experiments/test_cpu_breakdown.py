@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -218,7 +219,9 @@ class TestAnalysis(unittest.TestCase):
             self.run_("traced", 1.0, 9, monitor_stop=0.0),
             self.run_("plain", 1.0, 1),
         ]
-        self.assertFalse(bd.analyse(rows)["by_load_ranking_agrees"])
+        doc = bd.analyse(rows)
+        self.assertFalse(doc["by_load_ranking_agrees"])
+        self.assertIn("STUDY INCONCLUSIVE", bd.render({"valid": True, **doc}))
 
     def test_nothing_to_compare_without_both_kinds(self):
         self.assertNotIn("overhead", bd.analyse([self.run_("traced", 1.0, 1)]))
@@ -246,6 +249,24 @@ class TestRealAttempt(unittest.TestCase):
         got = bd.attempt(TASK, "plain", refs, self.tmp, strict=False)
         self.assertFalse(got["ok"])
         self.assertTrue(any("work_sha256" in p for p in got["problems"]))
+
+    def test_a_traced_attempt_without_a_trace_file_fails(self):
+        refs = {TASK: cp.reference(TASK, self.tmp)}
+
+        real = cp.measure_command
+
+        def untraced(command: list[str], log: str, timeout_s: float):
+            # run the real engine child but never write the trace file
+            plain = [sys.executable, "-m", "experiments.cpu_profile", "one"]
+            plain += ["--task", command[5], "--run-dir", command[6]]
+            plain.append("--no-strict-isolation")
+            return real(plain, log, timeout_s)
+
+        with mock.patch.object(bd.cp, "measure_command", untraced):
+            got = bd.attempt(TASK, "traced", refs, self.tmp, strict=False)
+        self.assertFalse(got["ok"])
+        self.assertTrue(any("trace missing" in p for p in got["problems"]))
+        self.assertNotIn("breakdown", got)
 
 
 class TestCli(unittest.TestCase):
