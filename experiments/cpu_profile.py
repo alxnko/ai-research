@@ -312,13 +312,20 @@ def one_main(argv: list[str]) -> int:
 def measure_child(
     task: str, run_dir: str, *, strict: bool, log: str, timeout_s: float
 ) -> tuple[dict[str, Any], int, bool]:
-    """Run one child and measure it from outside (wait4 covers its descendants).
-    A child past `timeout_s` is killed (its process group) and flagged; its
-    directory and log are kept by the caller."""
+    """One scripted attempt in a fresh process, measured from outside."""
     cmd = [sys.executable, "-m", "experiments.cpu_profile", "one"]
     cmd += ["--task", task, "--run-dir", run_dir]
     if not strict:
         cmd.append("--no-strict-isolation")
+    return measure_command(cmd, log, timeout_s)
+
+
+def measure_command(
+    cmd: list[str], log: str, timeout_s: float
+) -> tuple[dict[str, Any], int, bool]:
+    """Run `cmd` and measure it from outside (wait4 covers its descendants).
+    A child past `timeout_s` is killed (its process group) and flagged; its
+    directory and log are kept by the caller."""
     t0 = time.perf_counter()
     with open(log, "wb") as out:
         proc = subprocess.Popen(
