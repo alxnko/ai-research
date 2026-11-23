@@ -28,6 +28,7 @@ METRICS = [
     for i in range(8)
 ]
 STOP_BOUND_S = 0.05
+IN_FLIGHT_S = 0.2  # how long the scripted in-flight query runs
 # Stop request times (from the monitor's start): mid-sleep, mid-query, later.
 SCENARIOS = {"mid-sleep": 1.2, "mid-query": 0.04, "late": 2.3}
 
@@ -146,33 +147,81 @@ def scripted_problems(control: types.ModuleType, treatment: types.ModuleType):
     return problems
 
 
-def real_stop_latency(module: types.ModuleType) -> float:
-    """Seconds `stop()` takes once the sampler has finished a query and is about
-    to wait: real threads, a fast scripted query."""
-    sampled = threading.Event()
+class SignallingEvent(threading.Event):
+    """A real event that reports the moment the sampler reaches its wait."""
+
+    def __init__(self, entered: threading.Event):
+        super().__init__()
+        self.entered = entered
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.entered.set()
+        return super().wait(timeout)
+
+
+def real_stop(module: types.ModuleType, *, in_flight: bool) -> tuple[float, dict]:
+    """Real threads. Returns how long `stop()` took and its record.
+
+    Ordinary shutdown: stop only once the sampler has reached the wait boundary
+    (the control's `time.sleep` or the treatment's `Event.wait`, both signalled
+    here). In flight: stop while a GPU query is still running; the query is
+    released after IN_FLIGHT_S."""
+    entered, queried, release = (threading.Event() for _ in range(3))
 
     def get_gpu_memory() -> dict[str, Any]:
-        sampled.set()
+        queried.set()
+        if in_flight:
+            release.wait(5.0)
         return METRICS[0]
 
-    patch(module, time=time, get_gpu_memory=get_gpu_memory)
+    def sleep(seconds: float) -> None:
+        entered.set()
+        time.sleep(seconds)
+
+    clock = types.SimpleNamespace(
+        time=time.time, perf_counter=time.perf_counter, sleep=sleep
+    )
+    patch(module, time=clock, get_gpu_memory=get_gpu_memory)
     monitor = module.VramMonitor(INTERVAL_S)
+    monitor.stop_event = SignallingEvent(entered)
     monitor.start()
-    if not sampled.wait(5.0):
-        raise RuntimeError("the sampler never ran")
+    if not (queried if in_flight else entered).wait(5.0):
+        raise RuntimeError("the sampler never reached the expected point")
+    if in_flight:
+        threading.Timer(IN_FLIGHT_S, release.set).start()
     t0 = time.perf_counter()
-    monitor.stop()
-    return time.perf_counter() - t0
+    record = monitor.stop()
+    return time.perf_counter() - t0, record
+
+
+STABLE = (
+    "monitor_sample_count",
+    "peak_device_vram_mib",
+    "peak_ollama_vram_mib",
+    "telemetry_status",
+    "telemetry_source",
+)  # real-time fields (gap, overhead) are compared only under the fake clock
 
 
 def threaded_problems(control: types.ModuleType, treatment: types.ModuleType):
     problems = []
-    fast = real_stop_latency(treatment)
-    slow = real_stop_latency(control)
+    fast, rec_t = real_stop(treatment, in_flight=False)
+    slow, rec_c = real_stop(control, in_flight=False)
     if fast > STOP_BOUND_S:
         problems.append(f"treatment stop() took {fast:.3f}s (> {STOP_BOUND_S}s)")
     if slow < 5 * STOP_BOUND_S:
         problems.append(f"control stop() took only {slow:.3f}s: test is not testing")
+    if [rec_c[k] for k in STABLE] != [rec_t[k] for k in STABLE]:
+        problems.append(f"ordinary shutdown: records differ: {rec_c} vs {rec_t}")
+    # A query in flight: both wait for it (the 50 ms bound does not apply); the
+    # recorded values must still be identical.
+    t_wait, t_rec = real_stop(treatment, in_flight=True)
+    c_wait, c_rec = real_stop(control, in_flight=True)
+    for label, waited in (("treatment", t_wait), ("control", c_wait)):
+        if waited < 0.75 * IN_FLIGHT_S:
+            problems.append(f"{label} did not wait for the in-flight query")
+    if [c_rec[k] for k in STABLE] != [t_rec[k] for k in STABLE]:
+        problems.append(f"in-flight shutdown: records differ: {c_rec} vs {t_rec}")
     return problems
 
 

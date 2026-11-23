@@ -155,3 +155,44 @@ approved; changing `v0.5`, its tag, or the EXP-2 and SMOKE-LIVE-1 records.
    calibration-set dry run only. Reviewed and merged before step 3.
 3. One registered final-set run; results in `CPU-OPT-1_RESULTS.md`, raw records
    gitignored.
+
+## Amendment 1 (review of the implementation PR; before any final-set run)
+The final set has not been run or inspected. These tighten the registered
+conditions; the hypothesis, variable, arms, metric and thresholds are unchanged.
+
+1. **Load groups, exact policy.** Per pair the host CPU pressure (`avg10`) is read
+   once. `cut` = the median of the 100 readings. The low-load group is the pairs
+   strictly below `cut`, the high-load group those strictly above; pairs at `cut`
+   belong to neither. The groups are **evaluable only if each has at least 20
+   pairs**. Otherwise (for example an idle host reading 0.00 throughout, or no
+   pressure data) the load-robustness condition is **not evaluable** and the
+   decision is *inconclusive due to load*; no load group is manufactured by
+   ranking ties. When evaluable, the median `d` must have the same sign in both
+   groups (positive in both for a gain).
+2. **Final-run settings are fixed:** strict isolation, exactly 10 repetitions and
+   exactly 600 CPU-seconds. The runner rejects `--no-strict` and any other budget
+   for `--set final`. (The calibration dry run may vary them.)
+3. **Exact matrix.** Before analysis, every registered (task, repetition, arm)
+   cell must occur exactly once. A missing, duplicate or unexpected cell makes the
+   run invalid regardless of the row count.
+4. **Stop on the first failed attempt.** After any attempt that fails its gate,
+   no further attempt starts (not even the partner of the pair); the failed
+   attempt and its log are preserved and no statistics are computed.
+5. **Crash-safe records.** Each attempt is appended to `attempts.jsonl` and fsynced
+   as it completes; a failed attempt's log is copied at once. A runner exception
+   is recorded as `aborted` in the summary; the run is invalid.
+6. **Globally one-shot.** The first final run creates an exclusive reservation
+   (`runs/cpu-opt1/final-run.json`) after preflight (arm, equivalence and
+   reference checks) and before the first measurement, so a failed preflight does
+   not consume it. A later final run to any other `--out` is refused. The single
+   recovery of stop condition 5 needs `--recover-of <original out>`; it is allowed
+   only if the original run crashed or recorded `aborted` and never produced a
+   result; a gate failure, digest or hash mismatch, or any statistic is not
+   recoverable. It takes a second exclusive reservation
+   (`final-recovery.json`), leaves the original directory untouched, and the new
+   summary names the original.
+7. **Monitor equivalence, real threads.** Both the control's `time.sleep` and the
+   treatment's `Event.wait` signal when the sampler reaches the wait; ordinary
+   shutdown is tested only after that signal. A second case stops the monitor
+   while a scripted GPU query is in flight: both implementations must wait for it
+   and record identical sample count and peaks (the 50 ms bound does not apply).

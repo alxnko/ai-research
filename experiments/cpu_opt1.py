@@ -10,6 +10,7 @@ The final set needs `--registered-final` and is used once.
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
 import hashlib
 import json
@@ -21,6 +22,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from typing import Any
 
@@ -52,6 +54,11 @@ MIN_LOWER_BOUND_S = 0.10
 MAX_CPU_REGRESSION_S = 0.02
 CPU_BUDGET_S = 600.0
 REPS = 10
+MIN_HALF = 20  # pairs required in each load group for the halves to be evaluable
+ARMS = ("control", "treatment")
+RESERVATION_DIR = os.path.join(cp.ROOT, "runs", "cpu-opt1")
+RESERVED = "final-run.json"  # exclusive: created once, by the first final run
+RECOVERY = "final-recovery.json"  # exclusive: the single infrastructure recovery
 
 
 # ------------------------------------------------------------------------ arms
@@ -177,6 +184,24 @@ def pair_order(rep: int, index: int) -> list[str]:
     )
 
 
+def matrix_problems(
+    rows: list[dict[str, Any]], tasks: list[str], reps: int
+) -> list[str]:
+    """Every registered (task, repetition, arm) cell exactly once, nothing else."""
+    expected = collections.Counter(
+        (t, r, a) for t in tasks for r in range(reps) for a in ARMS
+    )
+    actual = collections.Counter((r["task"], r["rep"], r["arm"]) for r in rows)
+    problems = []
+    if missing := sorted(expected - actual):
+        problems.append(f"missing cells: {missing}")
+    if dup := sorted(k for k, n in actual.items() if k in expected and n > 1):
+        problems.append(f"duplicate cells: {dup}")
+    if extra := sorted(k for k in actual if k not in expected):
+        problems.append(f"unexpected cells: {extra}")
+    return problems
+
+
 def validity_problems(
     rows: list[dict[str, Any]], tasks: list[str], reps: int, budget_s: float
 ) -> list[str]:
@@ -186,8 +211,7 @@ def validity_problems(
         for r in rows
         if not r["ok"]
     ]
-    if len(rows) != 2 * len(tasks) * reps:
-        problems.append(f"incomplete matrix: {len(rows)} of {2 * len(tasks) * reps}")
+    problems += matrix_problems(rows, tasks, reps)
     digests: dict[str, set[str | None]] = {}
     for r in rows:
         digests.setdefault(r["task"], set()).add(r["digest"])
@@ -272,19 +296,24 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
             r["wall_s"] for r in rows if r["arm"] == "treatment"
         ),
     }
-    # Halves split at the median pressure by rank (ties, common on an idle host
-    # where avg10 is 0.00, are broken by run order), so both halves always exist.
+    # Registered tie policy: cut = median pressure; low is strictly below it, high
+    # strictly above, pairs at the cut belong to neither. If either group has fewer
+    # than MIN_HALF pairs (for example an idle host reading 0.00 throughout) the
+    # load groups are not evaluable and no high-load group is manufactured.
     halves = None
-    if all(p["pressure"] is not None for p in ps) and len(ps) >= 2:
-        ranked = sorted(ps, key=lambda p: p["pressure"])  # stable: run order
-        mid = len(ranked) // 2
-        low, high = ranked[:mid], ranked[mid:]
-        halves = {
-            "cut": ranked[mid]["pressure"],
-            "low": statistics.median(p["d"] for p in low),
-            "high": statistics.median(p["d"] for p in high),
-        }
-    out["load_halves"] = halves
+    if all(p["pressure"] is not None for p in ps):
+        cut = statistics.median(p["pressure"] for p in ps)
+        low = [p["d"] for p in ps if p["pressure"] < cut]
+        high = [p["d"] for p in ps if p["pressure"] > cut]
+        if len(low) >= MIN_HALF and len(high) >= MIN_HALF:
+            halves = {
+                "cut": cut,
+                "low_pairs": len(low),
+                "high_pairs": len(high),
+                "low": statistics.median(low),
+                "high": statistics.median(high),
+            }
+    out["load_halves"] = halves  # None: not evaluable
     return out
 
 
@@ -304,19 +333,137 @@ def decide(stats: dict[str, Any]) -> str:
 # ------------------------------------------------------------------------- run
 
 
+class Recorder:
+    """Appends each attempt durably as it completes and keeps a failed attempt's
+    log at once, so a crash later cannot lose completed evidence."""
+
+    def __init__(self, out: str):
+        self.rows: list[dict[str, Any]] = []
+        self.out = out
+        self.path = os.path.join(out, "attempts.jsonl")
+
+    def __call__(self, row: dict[str, Any]) -> None:
+        log = row.get("failed_log")
+        if log and os.path.exists(log):
+            os.makedirs(os.path.join(self.out, "failed"), exist_ok=True)
+            shutil.copy(log, os.path.join(self.out, "failed"))
+            row = {**row, "failed_log": os.path.join("failed", os.path.basename(log))}
+        self.rows.append(row)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def refusal(args: argparse.Namespace, out: str) -> str | None:
+    """Reasons to refuse before touching anything."""
+    if any(
+        os.path.exists(os.path.join(out, n)) for n in ("summary.json", "attempts.jsonl")
+    ):
+        return f"{out} already holds records; choose a new --out"
+    if args.set != "final":
+        return "--recover-of applies to the final run only" if args.recover_of else None
+    for bad, why in (
+        (not args.registered_final, "the final set needs --registered-final"),
+        (args.reps != REPS, f"the registered final run uses exactly {REPS} reps"),
+        (args.no_strict, "the registered final run uses strict isolation"),
+        (
+            args.cpu_budget != CPU_BUDGET_S,
+            f"the registered final run uses exactly {CPU_BUDGET_S:.0f} CPU-seconds",
+        ),
+    ):
+        if bad:
+            return why
+    return None
+
+
+def read_json(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except OSError, ValueError:
+        return None
+
+
+def claim(name: str, record: dict[str, Any]) -> bool:
+    """Create a reservation file exclusively; False when it already exists."""
+    os.makedirs(RESERVATION_DIR, exist_ok=True)
+    try:
+        fd = os.open(
+            os.path.join(RESERVATION_DIR, name),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(record, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    return True
+
+
+def recovery_problem(original: str) -> str | None:
+    """A run may be recovered only if it never produced a result: it crashed or
+    aborted from a cause outside both arms. A completed run, a gate failure, a
+    digest or hash mismatch, or an effect statistic is never recoverable."""
+    first = read_json(os.path.join(RESERVATION_DIR, RESERVED))
+    if first is None or first.get("out") != os.path.abspath(original):
+        return "--recover-of must name the run that holds the final reservation"
+    summary = read_json(os.path.join(original, "summary.json"))
+    if summary is None:
+        if os.path.exists(os.path.join(original, "started.json")):
+            return None  # killed before any summary: a crash
+        return "the original run left no started record"
+    if "stats" in summary or summary.get("valid"):
+        return "the original run produced a result; it is not recoverable"
+    if "aborted" not in summary:
+        return "the original run failed a gate or check; that is a result, not infra"
+    return None
+
+
+def reserve_final(out: str, recover_of: str | None) -> str | None:
+    """Persistent, exclusive claim on the one registered final run."""
+    record = {"out": out, "recover_of": recover_of, "time": time.time()}
+    if recover_of is None:
+        if claim(RESERVED, record):
+            return None
+        first = read_json(os.path.join(RESERVATION_DIR, RESERVED)) or {}
+        return f"the registered final run was already started: {first.get('out')}"
+    if problem := recovery_problem(recover_of):
+        return problem
+    if not claim(RECOVERY, record):
+        return "the single infrastructure recovery was already used"
+    return None
+
+
+def run_matrix(
+    args: argparse.Namespace, out: str, tasks: list[str], base: str, rec: Recorder
+) -> list[str]:
+    """Preflight, reserve (final), measure. Preflight failures do not consume the
+    final reservation: nothing has been measured yet."""
+    arms = make_arms(os.path.join(base, "arms"))
+    problems = arm_problems(*arms) + monitor_equiv.equivalence_problems(
+        os.path.join(arms[0], TELEMETRY), os.path.join(arms[1], TELEMETRY)
+    )
+    refs, ref_problems = cp.build_references(tasks)
+    if problems or ref_problems:
+        return problems + ref_problems
+    if args.set == "final" and (err := reserve_final(out, args.recover_of)):
+        return [err]
+    with open(os.path.join(out, "started.json"), "w", encoding="utf-8") as f:
+        json.dump({"environment": cp.environment(), "set": args.set}, f)
+    scratch = os.path.join(base, "scratch")
+    os.makedirs(scratch)
+    ctx = Context(refs, scratch, not args.no_strict)
+    stopped = measure(arms, tasks, ctx, args, rec)
+    return [stopped] if stopped else []
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     out = os.path.abspath(args.out)
-    if os.path.exists(os.path.join(out, "summary.json")):
-        print(f"{out} already holds a result; choose a new --out", file=sys.stderr)
-        return 2
-    final = args.set == "final"
-    if final and not args.registered_final:
-        print("the final set needs --registered-final (one run only)", file=sys.stderr)
-        return 2
-    if final and args.reps != REPS:
-        print(
-            f"the registered final run uses exactly {REPS} repetitions", file=sys.stderr
-        )
+    if error := refusal(args, out):
+        print(error, file=sys.stderr)
         return 2
     try:
         tasks = cp.workload()[args.set]
@@ -325,42 +472,32 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     os.makedirs(out, exist_ok=True)
     base = tempfile.mkdtemp(prefix="cpu-opt1-", dir="/var/tmp")
-    rows: list[dict[str, Any]] = []
-    stopped = None
+    rec = Recorder(out)
+    aborted = None
     try:
-        arms = make_arms(os.path.join(base, "arms"))
-        problems = arm_problems(*arms)
-        problems += monitor_equiv.equivalence_problems(
-            os.path.join(arms[0], TELEMETRY), os.path.join(arms[1], TELEMETRY)
-        )
-        refs, ref_problems = cp.build_references(tasks)
-        problems += ref_problems
-        if not problems:
-            rows, stopped = measure(arms, tasks, refs, base, args)
+        problems = run_matrix(args, out, tasks, base, rec)
+    except Exception as exc:  # a runner fault, not a result: recorded, run invalid
+        aborted = f"{type(exc).__name__}: {exc}"
+        problems = [f"aborted: {aborted}"]
     finally:
-        drop_arms(*(os.path.join(base, "arms", n) for n in ("control", "treatment")))
-        keep = os.path.join(out, "failed")
-        for r in rows:
-            if r.get("failed_log") and os.path.exists(r["failed_log"]):
-                os.makedirs(keep, exist_ok=True)
-                shutil.copy(r["failed_log"], keep)
+        drop_arms(*(os.path.join(base, "arms", n) for n in ARMS))
         shutil.rmtree(base, ignore_errors=True)
-    if stopped:
-        problems.append(stopped)
-    problems += validity_problems(rows, tasks, args.reps, args.cpu_budget)
-    with open(os.path.join(out, "attempts.jsonl"), "w", encoding="utf-8") as f:
-        f.writelines(json.dumps(r, sort_keys=True) + "\n" for r in rows)
+    problems += validity_problems(rec.rows, tasks, args.reps, args.cpu_budget)
+    final = args.set == "final"
     summary: dict[str, Any] = {
         "valid": not problems,
         "problems": problems,
         "set": args.set,
         "dry_run": not final,
+        "recovery_of": args.recover_of,
         "environment": cp.environment(),
         "workload_sha256": cp.WORKLOAD_SHA256,
-        "cpu_spent_s": sum(r["cpu_s"] for r in rows),
+        "cpu_spent_s": sum(r["cpu_s"] for r in rec.rows),
     }
+    if aborted:
+        summary["aborted"] = aborted
     if not problems:  # no effect statistic is ever computed on an invalid run
-        summary["stats"] = analyse(rows)
+        summary["stats"] = analyse(rec.rows)
         summary["decision"] = (
             decide(summary["stats"]) if final else "DRY RUN: not part of the decision"
         )
@@ -372,26 +509,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if summary["valid"] else 1
 
 
-def measure(arms, tasks, refs, base, args):
-    rows: list[dict[str, Any]] = []
-    scratch = os.path.join(base, "scratch")
-    os.makedirs(scratch)
-    ctx = Context(refs, scratch, not args.no_strict)
-    roots = dict(zip(("control", "treatment"), arms, strict=True))
+def measure(arms, tasks, ctx, args, record) -> str | None:
+    """Run the pairs, recording each attempt as it completes. Returns why it
+    stopped early, or None when the whole matrix ran."""
+    roots = dict(zip(ARMS, arms, strict=True))
     for rep in range(args.reps):
         for i, task in enumerate(tasks):
-            spent = sum(r["cpu_s"] for r in rows)
-            worst = max((r["cpu_s"] for r in rows), default=0.0)
+            spent = sum(r["cpu_s"] for r in record.rows)
+            worst = max((r["cpu_s"] for r in record.rows), default=0.0)
             if spent + 2 * worst >= args.cpu_budget:  # admission control only
-                return (
-                    rows,
-                    f"cpu budget {args.cpu_budget:.0f}s: stopped admitting pairs",
-                )
+                return f"cpu budget {args.cpu_budget:.0f}s: stopped admitting pairs"
             host = pressure()  # one reading per pair, shared by both arms
             for arm in pair_order(rep, i):
                 row = attempt(arm, roots[arm], task, ctx)
-                rows.append({**row, "rep": rep, "pressure": host})
-    return rows, None
+                record({**row, "rep": rep, "pressure": host})
+                if not row["ok"]:  # registered stop condition: no further attempts
+                    return f"stopped after a failed attempt: {task} {arm} rep {rep}"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -404,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--cpu-budget", type=cp.budget_arg, default=CPU_BUDGET_S)
     r.add_argument("--registered-final", action="store_true")
     r.add_argument("--no-strict", action="store_true")
+    r.add_argument("--recover-of", help="the one infrastructure recovery (final)")
     r.set_defaults(fn=cmd_run)
     args = p.parse_args(argv)
     return args.fn(args)
