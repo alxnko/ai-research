@@ -321,7 +321,7 @@ def measure_child(
 
 
 def measure_command(
-    cmd: list[str], log: str, timeout_s: float
+    cmd: list[str], log: str, timeout_s: float, cwd: str = ROOT
 ) -> tuple[dict[str, Any], int, bool]:
     """Run `cmd` and measure it from outside (wait4 covers its descendants).
     A child past `timeout_s` is killed (its process group) and flagged; its
@@ -329,7 +329,7 @@ def measure_command(
     t0 = time.perf_counter()
     with open(log, "wb") as out:
         proc = subprocess.Popen(
-            cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
+            cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
         )
         timed_out = threading.Event()
 

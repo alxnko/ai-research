@@ -1,0 +1,9 @@
+diff --git a/bench/telemetry.py b/bench/telemetry.py
+index 8e9bcc1..ce6347c 100644
+--- a/bench/telemetry.py
++++ b/bench/telemetry.py
+@@ -669,3 +669,3 @@ class VramMonitor:
+                 self.peak_ollama_vram = max(self.peak_ollama_vram or 0, ollama_used)
+-            time.sleep(self.interval_s)
++            self.stop_event.wait(self.interval_s)
+ 
