@@ -52,6 +52,7 @@ from bench.validator_selftest import validator_selftests
 from experiments import (
     test_controller,
     test_cpu_breakdown,
+    test_cpu_opt1,
     test_cpu_profile,
     test_launcher,
     test_server_identity,
@@ -1906,6 +1907,7 @@ def controller_tests() -> list[tuple[str, str, str]]:
             test_launcher,
             test_server_identity,
             test_cpu_breakdown,
+            test_cpu_opt1,
             test_cpu_profile,
         )
     )
