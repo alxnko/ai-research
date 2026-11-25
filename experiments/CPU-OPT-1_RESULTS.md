@@ -48,10 +48,12 @@ The change under test is one line in `VramMonitor._sample`:
 Host CPU pressure (`avg10`) ranged 0.86 to 11.4 across the pairs. Load policy as
 registered; no window was chosen and load was not manipulated.
 
-## Independent recomputation
+## Post-run recomputation
 The summary's statistics were recomputed from the raw `attempts.jsonl` with the
 runner's own `validity_problems` and `analyse` after the run: no validity
-problems, statistics identical to the stored summary, decision identical.
+problems, statistics identical to the stored summary, decision identical. This is
+a consistency check with the same implementation, not an independently written
+analysis. The local evidence hashes below cannot be verified from GitHub alone.
 
 ## What this supports, and what it does not
 Supported: replacing the monitor's unconditional sleep with an interruptible
@@ -80,4 +82,7 @@ the decision.
 ## Next
 Adopting the change as `v0.6` is a separate reviewed release PR (apply exactly the
 validated patch, update the version identity and frozen-source gates, keep `v0.5`
-immutable, tag only after merge). It is not done here.
+immutable). Release procedure: the annotated `v0.6` tag is created on the fully
+reviewed release-PR head commit immediately before merging, so exact-head CI can
+verify the release; the tag identifies that commit, not the merge commit. It is
+not done here.
