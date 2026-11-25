@@ -3,11 +3,13 @@ the stratified analysis and the decision rule, and the run's refusal paths."""
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,11 +22,32 @@ from experiments import monitor_equiv as eq
 
 SLEEP = "            time.sleep(self.interval_s)"
 WAIT = "            self.stop_event.wait(self.interval_s)"
-TELEMETRY = os.path.join(cp.ROOT, "bench", "telemetry.py")
+TELEMETRY = os.path.join(cp.ROOT, "bench", "telemetry.py")  # the checkout (v0.6)
+
+
+def v05_source() -> bytes:
+    """The control: `bench/telemetry.py` as released in the immutable v0.5 tag."""
+    return subprocess.run(
+        ["git", "-C", cp.ROOT, "show", "v0.5:bench/telemetry.py"],
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+def _control_file() -> str:
+    folder = tempfile.mkdtemp(prefix="cpu-opt1-v05-", dir="/var/tmp")
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    path = os.path.join(folder, "telemetry.py")
+    with open(path, "wb") as f:
+        f.write(v05_source())
+    return path
+
+
+CONTROL = _control_file()
 
 
 def treatment_source(*, mutate: tuple[str, str] | None = None) -> str:
-    with open(TELEMETRY, encoding="utf-8") as f:
+    with open(CONTROL, encoding="utf-8") as f:
         src = f.read()
     assert SLEEP in src
     src = src.replace(SLEEP, WAIT)
@@ -43,13 +66,13 @@ class TestMonitorEquivalence(unittest.TestCase):
         path = os.path.join(self.tmp, "treatment.py")
         with open(path, "w", encoding="utf-8") as f:
             f.write(source)
-        return eq.equivalence_problems(TELEMETRY, path)
+        return eq.equivalence_problems(CONTROL, path)
 
     def test_the_registered_treatment_is_equivalent(self):
         self.assertEqual(self.problems(treatment_source()), [])
 
     def test_the_control_is_not_its_own_treatment(self):
-        with open(TELEMETRY, encoding="utf-8") as f:
+        with open(CONTROL, encoding="utf-8") as f:
             found = self.problems(f.read())
         self.assertTrue(any("kept waiting" in p for p in found), found)
 
@@ -72,7 +95,7 @@ class TestMonitorEquivalence(unittest.TestCase):
         self.assertTrue(any("records differ" in p for p in found), found)
 
     def test_a_treatment_that_still_sleeps_is_caught(self):
-        with open(TELEMETRY, encoding="utf-8") as f:
+        with open(CONTROL, encoding="utf-8") as f:
             found = self.problems(f.read())
         self.assertTrue(found)
 
@@ -81,11 +104,38 @@ class TestArms(unittest.TestCase):
     def setUp(self) -> None:
         self.base = tempfile.mkdtemp(prefix="cpu-opt1-arms-", dir="/var/tmp")
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        # The runner builds arms from a commit whose telemetry is the v0.5 control.
+        # The checkout is v0.6, so reproduce that state in a throwaway clone.
+        clone = os.path.join(self.base, "clone")
+        run = ["git", "-C", clone]
+        subprocess.run(
+            ["git", "clone", "-q", "--no-hardlinks", cp.ROOT, clone], check=True
+        )
+        with open(os.path.join(clone, opt.TELEMETRY), "wb") as f:
+            f.write(v05_source())
+        who = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*run, *who, "commit", "-qam", "v0.5 telemetry"], check=True)
+        for target, value in (
+            (cp, ("ROOT", clone)),
+            (
+                opt,
+                (
+                    "PATCH",
+                    os.path.join(clone, "experiments", "cpu_opt1_treatment.patch"),
+                ),
+            ),
+        ):
+            self.enterContext(mock.patch.object(target, *value))
         self.control, self.treatment = opt.make_arms(self.base, allow_dirty=True)
         self.addCleanup(opt.drop_arms, self.control, self.treatment)
 
     def test_the_arms_differ_by_exactly_the_registered_change(self):
         self.assertEqual(opt.arm_problems(self.control, self.treatment), [])
+
+    def test_the_release_checkout_is_the_validated_treatment(self):
+        # v0.6 is exactly the control plus the registered patch
+        self.assertEqual(opt.sha256_file(TELEMETRY), opt.TREATMENT_TELEMETRY)
+        self.assertEqual(opt.sha256_file(CONTROL), opt.CONTROL_TELEMETRY)
 
     def test_the_pinned_treatment_hash_matches_the_patch(self):
         got = opt.sha256_file(os.path.join(self.treatment, opt.TELEMETRY))
@@ -615,7 +665,7 @@ class TestEquivalenceBarrier(unittest.TestCase):
     """The real-thread part synchronizes at the wait boundary, both ways."""
 
     def test_in_flight_and_ordinary_shutdown_are_both_exercised(self):
-        control = eq.load(TELEMETRY, "opt1_test_control")
+        control = eq.load(CONTROL, "opt1_test_control")
         self.addCleanup(sys.modules.pop, "opt1_test_control", None)
         waited, record = eq.real_stop(control, in_flight=True)
         self.assertGreaterEqual(waited, 0.75 * eq.IN_FLIGHT_S)
