@@ -9,9 +9,11 @@ each experiment below needs its own registered protocol first.
 ## Problem
 Coding agents are usually evaluated with large hosted models. Developers who need
 privacy, offline use or low cost run small models (about 4B parameters) on consumer
-GPUs (8 GB VRAM). Pilot v0 on this repository solved 1 of 24 tasks with a 9B model
-at 53.6 minutes, and the 4B smoke test showed that a single agent attempt takes
-about 18 s. Whether such models can be made useful, and by what, is open.
+GPUs (8 GB VRAM). Whether such models can be made useful, and by what, is open.
+The repository's SMOKE-LIVE-1 (a single pipeline smoke test with a 4B model, one
+successful 18.4 s attempt) shows the full pipeline works on this hardware; it is not
+representative model latency or evidence of capability. No pilot score is cited here
+because no frozen record of one is kept in the repository.
 
 ## Research question
 Under fixed hardware and inference budgets, do (a) structured execution feedback
@@ -24,6 +26,11 @@ small local coding model?
 - **H2 (context).** Giving the model the files and symbols relevant to the task,
   chosen by a deterministic, model-free selector, raises verified success versus the
   unchanged default context.
+- **Information boundary (validity requirement).** The feedback transformation (H1)
+  operates only on agent-visible execution output. Hidden scoring tests, golden
+  solutions and evaluator-only results never enter feedback. The context selector
+  (H2) is frozen before holdout evaluation and cannot read hidden fixtures or
+  scorer-owned copies; both are checked by tests before any run.
 - Each is tested as **one intervention at a time** against the unchanged 4B baseline.
   Negative results are reported as such.
 
@@ -64,11 +71,19 @@ small local coding model?
 2. A reproducible, preregistered evaluation method for small local agents.
 3. An open harness with provenance checks.
 
-## Related work to position against (verify citations before submission)
-SWE-bench and SWE-agent (agent-computer interface design), Agentless (non-agentic
-localization and repair), Self-Debug and Reflexion (execution feedback and
-verbal reinforcement), and retrieval/context-selection work for code. The claim to
-test is narrower than these: small local models, fixed consumer-hardware budgets.
+## Related work
+Verified publications to position against:
+- SWE-bench (ICLR 2024): software-engineering evaluation. SWE-agent (NeurIPS 2024):
+  agent-computer interfaces. Agentless (FSE 2025): localization and repair without
+  an agent loop.
+- Teaching Large Language Models to Self-Debug (ICLR 2024) and Reflexion
+  (NeurIPS 2023): execution feedback and verbal reinforcement.
+- RepoCoder (EMNLP 2023) and Repoformer (ICML 2024): repository context retrieval
+  and selective retrieval.
+
+These make the two interventions established ideas, not novel ones. The thesis
+contribution is the **controlled, preregistered evaluation of small local coding
+agents under fixed consumer-hardware budgets**, compared against these approaches.
 
 ## Risks and limits
 - Small models may not use richer feedback; a null result is acceptable and reported.
