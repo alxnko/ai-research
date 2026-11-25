@@ -107,8 +107,22 @@ hours or overwrite experiment records.
   quantities.
 - **Coupling.** A runnable manifest executes the registered release: once
   `bench/*.py` legitimately changes on `main`, tag a new benchmark version and
-  register a new manifest (and the launcher tests' `v0.5` reference) rather than
-  editing in place.
+  register a new manifest (and the launcher tests' release reference, now `v0.6`)
+  rather than editing in place.
+- **Release procedure (`v0.6`, a deliberate exception to tag-after-merge).** The
+  launcher tests verify the checkout against the release tag and CI fails closed
+  when it is missing, so the tag cannot wait for the merge. For `v0.6`: review and
+  freeze the release PR head; check it in a separate clone with a temporary local
+  tag; create the annotated tag on that exact head and push it; rerun CI on the
+  unchanged head; merge with a merge commit. The tag identifies the reviewed PR
+  head, never the merge commit (source identity compares files to the tagged
+  commit and ignores `HEAD`). After merge, confirm the tagged commit is an
+  ancestor of `main` and the release files match the tag. A published tag is never
+  moved or deleted. Later releases need a release-candidate mechanism instead.
+- **CPU-OPT-1 reproduction.** The runner builds both arms from one commit whose
+  `bench/telemetry.py` is the `v0.5` control, so it is reproducible at `8b60df9`
+  (the registered run commit), not on `v0.6`. Its tests rebuild that state from the
+  `v0.5` tag.
 - **Server-side model identity** (`experiments/server_identity.py`, real
   backend only). The local store fingerprint above says what is on disk, not what
   the serving process has loaded, so the launcher also asks the server:

@@ -2,7 +2,7 @@
 
 Source-identity tests run on throw-away git repositories, so drift cases never
 touch this checkout. The launcher tests run the real controller -> launcher ->
-bench (mock model) -> validation -> promotion path against the real `v0.5`
+bench (mock model) -> validation -> promotion path against the real `v0.6`
 release (skipped, and reported as such, if that tag is not fetched).
 """
 
@@ -32,7 +32,7 @@ from experiments import controller, launcher, server_identity, source_identity
 from experiments.test_server_identity import FakeOllama, ps_entry, tags_entry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TAG = "v0.5"
+TAG = "v0.6"
 SOURCE_FILES = [
     "bench/__init__.py",
     "bench/bench.py",
@@ -322,7 +322,7 @@ def have_release() -> bool:
 
 
 class Release(Quiet):
-    """A runnable manifest against the real v0.5 release, a fake Ollama store."""
+    """A runnable manifest against the real v0.6 release, a fake Ollama store."""
 
     MODEL = "qwen3.5:4b-q4_K_M"
 

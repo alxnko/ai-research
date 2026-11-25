@@ -667,7 +667,7 @@ class VramMonitor:
             ollama_used = metrics.get("ollama_vram_used_mib")
             if ollama_used is not None:
                 self.peak_ollama_vram = max(self.peak_ollama_vram or 0, ollama_used)
-            time.sleep(self.interval_s)
+            self.stop_event.wait(self.interval_s)
 
     def start(self) -> None:
         if self.telemetry_status != "available":
