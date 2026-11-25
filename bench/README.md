@@ -75,6 +75,12 @@ cannot drift silently.
 | `v0.4` | the 24 original tasks | Frozen, byte-identical to tag `v0.4`. EXP-2 used six of them. |
 | `v0.5` | v0.4 with two tasks replaced | `backend-idempotency-v2` and `debugging-money-round-v2` replace their originals. |
 
+Release `v0.6` keeps suite `v0.5` and its tasks unchanged. It differs from release
+`v0.5` only in `bench/telemetry.py`: `VramMonitor` ends its pass with
+`stop_event.wait(interval)` instead of `time.sleep(interval)`, so `stop()` no longer
+waits out the sleep (registered experiment CPU-OPT-1; sample count and peaks are
+unchanged). `bench.py`, `classifier.py` and `__init__.py` are byte-identical to `v0.5`.
+
 `bench.py` requires `--task` or `--suite`; it never runs "everything on disk",
 so legacy and corrected task versions cannot be evaluated together by accident.
 `--suite` also checks each task's fixture digest against the suite before it
