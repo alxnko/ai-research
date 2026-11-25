@@ -85,6 +85,52 @@ These make the two interventions established ideas, not novel ones. The thesis
 contribution is the **controlled, preregistered evaluation of small local coding
 agents under fixed consumer-hardware budgets**, compared against these approaches.
 
+## References
+Verified against the venue's proceedings page or the arXiv record (authors, year,
+venue). Only abstracts and records were checked for the starred entries (*), not the
+full papers.
+
+1. Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., & Narasimhan, K.
+   (2024). SWE-bench: Can Language Models Resolve Real-World GitHub Issues? ICLR 2024.
+   https://proceedings.iclr.cc/paper_files/paper/2024/hash/edac78c3e300629acfe6cbe9ca88fb84-Abstract-Conference.html
+2. Yang, J., Jimenez, C. E., Wettig, A., Lieret, K., Yao, S., Narasimhan, K., & Press,
+   O. (2024). SWE-agent: Agent-Computer Interfaces Enable Automated Software
+   Engineering. NeurIPS 2024.
+   https://proceedings.neurips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html
+3. Xia, C. S., Deng, Y., Dunn, S., & Zhang, L. (2025). Demystifying LLM-Based Software
+   Engineering Agents (Agentless). FSE 2025.
+   https://conf.researchr.org/details/fse-2025/fse-2025-research-papers/85/Demystifying-LLM-based-Software-Engineering-Agents
+4. Chen, X., Lin, M., Schaerli, N., & Zhou, D. (2024). Teaching Large Language Models
+   to Self-Debug. ICLR 2024.
+   https://proceedings.iclr.cc/paper_files/paper/2024/hash/2460396f2d0d421885997dd1612ac56b-Abstract-Conference.html
+5. Shinn, N., Cassano, F., Gopinath, A., Narasimhan, K., & Yao, S. (2023). Reflexion:
+   Language Agents with Verbal Reinforcement Learning. NeurIPS 2023.
+   https://proceedings.neurips.cc/paper/2023/hash/1b44b878bb782e6954cd888628510e90-Abstract-Conference.html
+6. Zhang, F., Chen, B., Zhang, Y., Keung, J., Liu, J., Zan, D., Mao, Y., Lou, J.-G., &
+   Chen, W. (2023). RepoCoder: Repository-Level Code Completion Through Iterative
+   Retrieval and Generation. EMNLP 2023. https://aclanthology.org/2023.emnlp-main.151/
+7. Wu, D., Ahmad, W. U., Zhang, D., Ramanathan, M. K., & Ma, X. (2024). Repoformer:
+   Selective Retrieval for Repository-Level Code Completion. ICML 2024.
+   https://proceedings.mlr.press/v235/wu24a.html
+8. *Olausson, T. X., et al. (2024). Is Self-Repair a Silver Bullet for Code Generation?
+   ICLR 2024. https://proceedings.iclr.cc/paper_files/paper/2024/hash/9ddc141bdbf9d1db510cefff56c586ad-Abstract-Conference.html
+9. *Pan, J., et al. (2025). Training Software Engineering Agents and Verifiers with
+   SWE-Gym. ICML 2025. https://proceedings.mlr.press/v267/pan25g.html
+10. *Tripathy, A., Harshit, C. P., & Vaidhyanathan, K. (2025). SWEnergy: An Empirical
+    Study on Energy Efficiency in Agentic Issue Resolution Frameworks with SLMs.
+    arXiv:2512.09543 (preprint). https://arxiv.org/abs/2512.09543
+11. *Peng, J., et al. (2026). SWE-Spot: Building Small Repo-Experts with
+    Repository-Centric Learning. arXiv:2601.21649 (preprint).
+    https://arxiv.org/abs/2601.21649
+12. *Kon, P. T. J., et al. (2026). SWE-Protege: Learning to Selectively Collaborate
+    With an Expert Unlocks Small Language Models as Software Engineering Agents.
+    arXiv:2602.22124 (preprint). https://arxiv.org/abs/2602.22124
+13. *Rastogi, A., et al. (2025). Devstral: Fine-tuning Language Models for Coding
+    Agent Applications. arXiv:2509.25193 (preprint). https://arxiv.org/abs/2509.25193
+
+A broader review of small-coding-model work is still needed before the dissertation;
+see `docs/THESIS_PREP.md`.
+
 ## Risks and limits
 - Small models may not use richer feedback; a null result is acceptable and reported.
 - 4B results may not transfer to other sizes. Not claimed.
